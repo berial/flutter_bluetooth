@@ -1,0 +1,26 @@
+name: flutter_bluetooth
+description: A Flutter Bluetooth plugin for Android that supports both classic Bluetooth and BLE scanning.
+  API mimics flutter_blue_plus.
+version: 0.1.0
+homepage: https://github.com/berial/flutter_bluetooth
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  collection: ^1.18.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: io.github.berial.flutter_bluetooth
+        pluginClass: FlutterBluetoothPlugin
