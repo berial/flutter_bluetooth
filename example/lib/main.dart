@@ -80,7 +80,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
 
       await FlutterBluetooth.instance.startScan(
         scanMode: 'lowLatency',
-        scanClassic: true, // Scan both classic and BLE
+        scanClassic: true,
         timeout: const Duration(seconds: 30),
       );
     } catch (e) {
@@ -102,7 +102,6 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
   Future<void> _connect(BluetoothDevice device) async {
     try {
       if (device.type == 'classic') {
-        // Classic Bluetooth: use RFCOMM SPP
         final connected = await device.connectRfcomm();
         if (connected && mounted) {
           Navigator.push(
@@ -113,7 +112,6 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
           );
         }
       } else {
-        // BLE: use GATT connection
         await device.connect(
           autoConnect: false,
           timeout: const Duration(seconds: 15),
@@ -124,7 +122,6 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
             SnackBar(content: Text(
                 'BLE Connected! Found ${services.length} services')),
           );
-          // Navigate to data communication page
           Navigator.push(
             context,
             MaterialPageRoute(
@@ -203,10 +200,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
       ),
       body: Column(
         children: [
-          // Status card
           _buildStatusCard(),
-
-          // Device list
           Expanded(
             child: _isScanning && _scanResults.isEmpty
                 ? const Center(
@@ -259,8 +253,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
               ],
             ),
             const SizedBox(height: 8),
-            if (_adapterName.isNotEmpty)
-              Text('Adapter: $_adapterName'),
+            if (_adapterName.isNotEmpty) Text('Adapter: $_adapterName'),
             Text('State: ${_adapterState.name}'),
           ],
         ),
@@ -328,7 +321,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
 
 class DataCommunicationPage extends StatefulWidget {
   final BluetoothDevice device;
-  final String mode; // "rfcomm" or "ble"
+  final String mode;
 
   const DataCommunicationPage({
     super.key,
@@ -341,7 +334,8 @@ class DataCommunicationPage extends StatefulWidget {
 }
 
 class _DataCommunicationPageState extends State<DataCommunicationPage> {
-  final TextEditingController _sendController = TextEditingController();
+  final TextEditingController _hexController = TextEditingController();
+  final TextEditingController _textController = TextEditingController();
   final List<_DataLog> _dataLogs = [];
   final ScrollController _scrollController = ScrollController();
   StreamSubscription? _dataSubscription;
@@ -354,13 +348,11 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
 
   void _setupDataReceiver() {
     if (widget.mode == 'rfcomm') {
-      // Classic Bluetooth RFCOMM — continuous stream
       _dataSubscription = widget.device.onRfcommDataReceived.listen(
         (data) => _addLog(data, isSent: false),
         onError: (e) => _addError('Stream error: $e'),
       );
     }
-    // For BLE, the stream is set up when the user calls getBleDataStream
   }
 
   void _setupBleStream(Guid serviceUuid, Guid characteristicUuid) {
@@ -374,7 +366,7 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
         (data) => _addLog(data, isSent: false),
         onError: (e) => _addError('BLE stream error: $e'),
       );
-      setState(() {}); // Refresh to show stream is active
+      setState(() {});
     } catch (e) {
       _addError('Failed to start BLE stream: $e');
     }
@@ -389,7 +381,6 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
       ));
     });
 
-    // Auto-scroll to bottom
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
@@ -412,31 +403,72 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
     });
   }
 
-  Future<void> _sendData() async {
-    final text = _sendController.text.trim();
+  /// Parse hex string like "AA BB CC" or "AABBCC" into bytes.
+  Uint8List _parseHex(String hex) {
+    final cleaned = hex.replaceAll(RegExp(r'[\s,]'), '');
+    if (cleaned.length % 2 != 0) {
+      throw FormatException('Hex string length must be even');
+    }
+    final bytes = <int>[];
+    for (int i = 0; i < cleaned.length; i += 2) {
+      bytes.add(int.parse(cleaned.substring(i, i + 2), radix: 16));
+    }
+    return Uint8List.fromList(bytes);
+  }
+
+  /// Send hex bytes (e.g. "AA BB 01 02").
+  Future<void> _sendHex() async {
+    final text = _hexController.text.trim();
     if (text.isEmpty) return;
 
-    final bytes = Uint8List.fromList(utf8.encode(text));
-    _sendController.clear();
+    Uint8List bytes;
+    try {
+      bytes = _parseHex(text);
+    } catch (e) {
+      _addError('Invalid hex: $e');
+      return;
+    }
+
+    _hexController.clear();
     _addLog(bytes, isSent: true);
 
     try {
-      if (widget.mode == 'rfcomm') {
-        await widget.device.sendRfcommData(bytes);
-      } else {
-        // BLE mode requires user to specify service/characteristic
-        // This is a generic send — in real use user specifies UUIDs
-        if (widget.device.servicesList.isEmpty) {
-          await widget.device.discoverServices();
-        }
-        if (widget.device.servicesList.isNotEmpty &&
-            widget.device.servicesList.first.characteristics.isNotEmpty) {
-          await widget.device.servicesList.first.characteristics.first
-              .write(bytes);
-        }
-      }
+      await _sendBytes(bytes);
     } catch (e) {
-      _addError('Send failed: $e');
+      _addError('Send hex failed: $e');
+    }
+  }
+
+  /// Send UTF-8 string with trailing \r\n.
+  Future<void> _sendText() async {
+    final text = _textController.text;
+    if (text.isEmpty) return;
+
+    final payload = '$text\r\n';
+    final bytes = Uint8List.fromList(utf8.encode(payload));
+    _textController.clear();
+    _addLog(bytes, isSent: true);
+
+    try {
+      await _sendBytes(bytes);
+    } catch (e) {
+      _addError('Send text failed: $e');
+    }
+  }
+
+  /// Low-level send for both modes.
+  Future<void> _sendBytes(Uint8List bytes) async {
+    if (widget.mode == 'rfcomm') {
+      await widget.device.sendRfcommData(bytes);
+    } else {
+      if (widget.device.servicesList.isEmpty) {
+        await widget.device.discoverServices();
+      }
+      if (widget.device.servicesList.isNotEmpty &&
+          widget.device.servicesList.first.characteristics.isNotEmpty) {
+        await widget.device.servicesList.first.characteristics.first
+            .write(bytes);
+      }
     }
   }
 
@@ -444,10 +476,8 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
     if (widget.device.servicesList.isEmpty) {
       await widget.device.discoverServices();
     }
-
     if (!mounted) return;
 
-    // Build a list of all characteristics
     final items = <_CharInfo>[];
     for (final service in widget.device.servicesList) {
       for (final char in service.characteristics) {
@@ -499,7 +529,8 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
   @override
   void dispose() {
     _dataSubscription?.cancel();
-    _sendController.dispose();
+    _hexController.dispose();
+    _textController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -524,10 +555,7 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
       ),
       body: Column(
         children: [
-          // Connection info
           _buildConnectionInfo(),
-
-          // Data log
           Expanded(
             child: _dataLogs.isEmpty
                 ? Center(
@@ -545,9 +573,7 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
                     itemBuilder: (_, i) => _buildDataRow(_dataLogs[i]),
                   ),
           ),
-
-          // Send input
-          _buildSendBar(),
+          _buildSendPanel(),
         ],
       ),
     );
@@ -586,7 +612,6 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
             : Colors.green.shade700;
     final prefix = log.isError ? 'ERR' : log.isSent ? 'SEND' : 'RECV';
 
-    // Try to decode as UTF-8 text for display
     String text;
     try {
       text = utf8.decode(log.data);
@@ -619,9 +644,7 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
             '${log.time.hour.toString().padLeft(2, '0')}:'
             '${log.time.minute.toString().padLeft(2, '0')}:'
             '${log.time.second.toString().padLeft(2, '0')}',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  fontSize: 10,
-                ),
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(fontSize: 10),
           ),
           const SizedBox(width: 8),
           Expanded(
@@ -639,7 +662,7 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
     );
   }
 
-  Widget _buildSendBar() {
+  Widget _buildSendPanel() {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -653,30 +676,89 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
         ],
       ),
       child: SafeArea(
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: TextField(
-                controller: _sendController,
-                decoration: InputDecoration(
-                  hintText: 'Enter data to send...',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
+            // Hex input row
+            Row(
+              children: [
+                SizedBox(
+                  width: 28,
+                  child: Text(
+                    'HEX',
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
                   ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 10,
-                  ),
-                  isDense: true,
                 ),
-                onSubmitted: (_) => _sendData(),
-              ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: _hexController,
+                    decoration: InputDecoration(
+                      hintText: 'e.g. AA BB 01 02',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      isDense: true,
+                    ),
+                    onSubmitted: (_) => _sendHex(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
+                  onPressed: _sendHex,
+                  icon: const Icon(Icons.send, size: 16),
+                  label: const Text('HEX', style: TextStyle(fontSize: 12)),
+                ),
+              ],
             ),
-            const SizedBox(width: 8),
-            FilledButton.tonalIcon(
-              onPressed: _sendData,
-              icon: const Icon(Icons.send, size: 18),
-              label: const Text('Send'),
+            const SizedBox(height: 8),
+            // String input row
+            Row(
+              children: [
+                SizedBox(
+                  width: 28,
+                  child: Text(
+                    'TXT',
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      color: Theme.of(context).colorScheme.secondary,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    decoration: InputDecoration(
+                      hintText: r'Send as UTF-8 (appends \r\n)',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      isDense: true,
+                    ),
+                    onSubmitted: (_) => _sendText(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
+                  onPressed: _sendText,
+                  icon: const Icon(Icons.send, size: 16),
+                  label: const Text('TXT', style: TextStyle(fontSize: 12)),
+                ),
+              ],
             ),
           ],
         ),
