@@ -446,7 +446,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
-        val data = call.argument<List<Int>>("data")?.map { it.toByte() }?.toByteArray() ?: run {
+        val data = call.argument<ByteArray>("data") ?: run {
             result.error("INVALID_ARG", "data required", null); return
         }
 

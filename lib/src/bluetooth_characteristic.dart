@@ -140,6 +140,12 @@ class BluetoothCharacteristic {
     _onValueReceivedController.add(value);
   }
 
+  /// 释放该特征持有的流控制器资源。
+  void dispose() {
+    _lastValueController.close();
+    _onValueReceivedController.close();
+  }
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||

@@ -26,6 +26,11 @@ class BluetoothDevice {
   bool get isConnected => _isConnected;
   bool get isDisconnected => !_isConnected;
 
+  /// 分别跟踪 BLE GATT 和 RFCOMM 连接状态，避免互相覆盖。
+  bool _isBleConnected = false;
+  bool _isRfcommConnected = false;
+  bool get isRfcommConnected => _isRfcommConnected;
+
   final StreamController<BluetoothConnectionState> _connectionStateController =
       StreamController<BluetoothConnectionState>.broadcast();
   Stream<BluetoothConnectionState> get connectionState =>
@@ -51,9 +56,6 @@ class BluetoothDevice {
   Stream<int> get mtu => _mtuController.stream;
 
   /// ── RFCOMM（经典蓝牙串口数据通信）──────────────────────────────────────
-
-  bool _isRfcommConnected = false;
-  bool get isRfcommConnected => _isRfcommConnected;
 
   final StreamController<Uint8List> _rfcommDataController =
       StreamController<Uint8List>.broadcast();
@@ -270,7 +272,11 @@ class BluetoothDevice {
     required Guid characteristicUuid,
     bool forceIndications = false,
   }) {
-    final controller = StreamController<Uint8List>();
+    // 如果已有活跃的数据流，先清理旧的
+    _bleDataStreamController?.close();
+    _bleDataStreamController = StreamController<Uint8List>();
+
+    final controller = _bleDataStreamController!;
 
     // 异步初始化：发现服务、查找特征、启用通知
     () async {
@@ -315,10 +321,25 @@ class BluetoothDevice {
     return controller.stream;
   }
 
+  /// 缓存的 BLE 数据流控制器，防止多次调用 getBleDataStream 泄漏。
+  StreamController<Uint8List>? _bleDataStreamController;
+
+  /// ── 生命周期 ──────────────────────────────────────────────────────────
+
+  /// 释放该设备持有的所有资源（流控制器等）。
+  void dispose() {
+    _bleDataStreamController?.close();
+    _connectionStateController.close();
+    _bondStateController.close();
+    _mtuController.close();
+    _rfcommDataController.close();
+  }
+
   /// ── 内部状态更新 ──────────────────────────────────────────────────────
 
   void _updateConnectionState(BluetoothConnectionState state) {
-    _isConnected = state == BluetoothConnectionState.connected;
+    _isBleConnected = state == BluetoothConnectionState.connected;
+    _syncCombinedConnectionState();
     _connectionStateController.add(state);
   }
 
@@ -338,10 +359,16 @@ class BluetoothDevice {
 
   void _updateRfcommConnection(bool connected) {
     _isRfcommConnected = connected;
-    _isConnected = connected || _isConnected;
+    _syncCombinedConnectionState();
     if (connected) {
       _connectionStateController.add(BluetoothConnectionState.connected);
+    } else if (!_isBleConnected) {
+      _connectionStateController.add(BluetoothConnectionState.disconnected);
     }
+  }
+
+  void _syncCombinedConnectionState() {
+    _isConnected = _isBleConnected || _isRfcommConnected;
   }
 
   void _addRfcommData(Uint8List data) {

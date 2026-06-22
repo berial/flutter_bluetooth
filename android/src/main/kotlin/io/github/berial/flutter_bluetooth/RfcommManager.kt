@@ -248,13 +248,14 @@ class RfcommManager(
             // 读取停止时自动清理
             try { inputStream.close() } catch (_: Exception) {}
             try { socket.close() } catch (_: Exception) {}
-            connections.remove(remoteId)
-            onDisconnected(remoteId)
-            sendEvent(mapOf(
-                "type" to "rfcommConnectionStateChanged",
-                "remoteId" to remoteId,
-                "state" to "disconnected"
-            ))
+            // 仅在非主动断开（即连接仍在 map 中）时发送事件，避免与 disconnect() 重复
+            if (connections.remove(remoteId) != null) {
+                sendEvent(mapOf(
+                    "type" to "rfcommConnectionStateChanged",
+                    "remoteId" to remoteId,
+                    "state" to "disconnected"
+                ))
+            }
         }
     }
 

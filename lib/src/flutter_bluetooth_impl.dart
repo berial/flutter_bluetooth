@@ -97,6 +97,9 @@ class FlutterBluetooth {
       case 'rfcommDataReceived':
         _handleRfcommDataReceived(map);
         break;
+      case 'scanError':
+        _handleScanError(map);
+        break;
     }
   }
 
@@ -192,6 +195,13 @@ class FlutterBluetooth {
     device?._addRfcommData(data);
   }
 
+  void _handleScanError(Map<String, dynamic> map) {
+    final errorCode = map['errorCode'] as int? ?? -1;
+    print('[FlutterBluetooth] BLE scan failed with error code: $errorCode');
+    _isScanning = false;
+    _isScanningController.add(false);
+  }
+
   // ─── 公共 API ──────────────────────────────────────────────────────────
 
   /// 检查设备是否支持蓝牙硬件。
@@ -199,7 +209,8 @@ class FlutterBluetooth {
     try {
       final result = await _channel.invokeMethod<bool>('isSupported');
       return result ?? false;
-    } catch (e) {
+    } catch (e, st) {
+      print('[FlutterBluetooth] isSupported error: $e\n$st');
       return false;
     }
   }
@@ -211,7 +222,8 @@ class FlutterBluetooth {
           await _channel.invokeMethod<String>('getAdapterName');
       _adapterName = name ?? '';
       return _adapterName;
-    } catch (e) {
+    } catch (e, st) {
+      print('[FlutterBluetooth] getAdapterName error: $e\n$st');
       return '';
     }
   }
@@ -292,7 +304,8 @@ class FlutterBluetooth {
         _knownDevices[device.remoteId] = device;
         return device;
       }).toList();
-    } catch (e) {
+    } catch (e, st) {
+      print('[FlutterBluetooth] getSystemDevices error: $e\n$st');
       return [];
     }
   }
@@ -310,7 +323,8 @@ class FlutterBluetooth {
         _knownDevices[device.remoteId] = device;
         return device;
       }).toList();
-    } catch (e) {
+    } catch (e, st) {
+      print('[FlutterBluetooth] getBondedDevices error: $e\n$st');
       return [];
     }
   }
@@ -611,5 +625,8 @@ class FlutterBluetooth {
   void dispose() {
     _eventSubscription?.cancel();
     _eventSubscription = null;
+    _adapterStateController.close();
+    _isScanningController.close();
+    _scanResultsController.close();
   }
 }

@@ -127,6 +127,11 @@ class BleManager(
 
         override fun onScanFailed(errorCode: Int) {
             android.util.Log.e("BleManager", "BLE scan failed with error: $errorCode")
+            isScanning = false
+            sendEvent(mapOf(
+                "type" to "scanError",
+                "errorCode" to errorCode
+            ))
         }
     }
 
@@ -217,15 +222,21 @@ class BleManager(
         if (gatt != null) {
             try {
                 gatt.disconnect()
-                gatt.close()
+                // 不在此处调用 close() — 由 onConnectionStateChange
+                // 收到 STATE_DISCONNECTED 后执行，避免竞态条件
             } catch (e: SecurityException) {}
-            gattMap.remove(remoteId)
         }
         mtuMap.remove(remoteId)
         pendingConnects.remove(remoteId)
         // 移除该设备的待处理分包写入
         pendingChunkedWrites.keys.filter { it.startsWith("${remoteId}_") }
             .forEach { pendingChunkedWrites.remove(it) }
+        // 通知 Dart 侧 MTU 已重置
+        sendEvent(mapOf(
+            "type" to "mtuChanged",
+            "remoteId" to remoteId,
+            "mtu" to DEFAULT_MTU
+        ))
     }
 
     // ─── GATT 操作 ─────────────────────────────────────────────────────
@@ -593,12 +604,23 @@ class BleManager(
                 if (nextChar != null) {
                     writeSingleChunk(gatt, nextChar, nextChunk, chunkedWrite.withoutResponse,
                         gatt.device.address, chunkedWrite.characteristicUuid, null)
+                } else {
+                    // 特征不可用，清理队列并报错
+                    pendingChunkedWrites.remove(writeKey)
+                    chunkedWrite.result.error("GATT_ERROR", "Characteristic not found for chunked write", null)
                 }
                 // 如果这是最后一个剩余分包，清理并报告成功
                 if (chunkedWrite.chunks.isEmpty()) {
                     pendingChunkedWrites.remove(writeKey)
                     chunkedWrite.result.success(null)
                 }
+                return
+            }
+
+            // 分包写入中任一分包失败，清理队列并报错
+            if (chunkedWrite != null && status != BluetoothGatt.GATT_SUCCESS) {
+                pendingChunkedWrites.remove(writeKey)
+                chunkedWrite.result.error("GATT_ERROR", "Chunked write failed at intermediate chunk: $status", null)
                 return
             }
 

@@ -79,6 +79,12 @@ class BluetoothDescriptor {
     );
   }
 
+  /// 释放该描述符持有的流控制器资源。
+  void dispose() {
+    _lastValueController.close();
+    _onValueReceivedController.close();
+  }
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
