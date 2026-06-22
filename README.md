@@ -1,5 +1,9 @@
 # flutter_bluetooth
 
+> 🤖 **本库由 AI 生成** — 代码、文档均通过 AI 辅助完成，请在实际使用前充分测试验证。
+
+[English](./README_EN.md) | 中文
+
 Android 蓝牙 Flutter 插件，支持**经典蓝牙（BR/EDR）**和 **BLE** 两种扫描与数据通信。
 
 API 设计仿照 [flutter_blue_plus](https://github.com/chipweinberger/flutter_blue_plus)，提供熟悉的开发体验。
