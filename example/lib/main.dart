@@ -119,8 +119,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
         final services = await device.discoverServices();
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(
-                'BLE Connected! Found ${services.length} services')),
+            SnackBar(content: Text('BLE Connected! Found ${services.length} services')),
           );
           Navigator.push(
             context,
@@ -265,9 +264,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
     final device = result.device;
     return ListTile(
       leading: CircleAvatar(
-        backgroundColor: device.type == 'classic'
-            ? Colors.blue.shade100
-            : Colors.green.shade100,
+        backgroundColor: device.type == 'classic' ? Colors.blue.shade100 : Colors.green.shade100,
         child: Icon(
           _deviceTypeIcon(device.type),
           color: device.type == 'classic' ? Colors.blue : Colors.green,
@@ -293,8 +290,7 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
                 materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
               const SizedBox(width: 4),
-              Text('RSSI: ${result.rssi} dBm',
-                  style: Theme.of(context).textTheme.bodySmall),
+              Text('RSSI: ${result.rssi} dBm', style: Theme.of(context).textTheme.bodySmall),
             ],
           ),
         ],
@@ -339,6 +335,8 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
   final List<_DataLog> _dataLogs = [];
   final ScrollController _scrollController = ScrollController();
   StreamSubscription? _dataSubscription;
+  Timer? _readTimer;
+  bool _autoReadEnabled = false;
 
   @override
   void initState() {
@@ -352,6 +350,58 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
         (data) => _addLog(data, isSent: false),
         onError: (e) => _addError('Stream error: $e'),
       );
+    }
+  }
+
+  /// Start periodic polling using the HEX input content (1s interval).
+  /// The HEX field must be filled with a valid command beforehand.
+  void _startAutoRead() {
+    _stopAutoRead();
+    _autoReadEnabled = true;
+    _readTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _sendPolledHex();
+    });
+    // Send first immediately.
+    _sendPolledHex();
+    if (mounted) setState(() {});
+  }
+
+  /// Send the current HEX field content silently (no SEND log).
+  Future<void> _sendPolledHex() async {
+    final text = _hexController.text.trim();
+    if (text.isEmpty) return;
+
+    Uint8List bytes;
+    try {
+      bytes = _parseHex(text);
+    } catch (_) {
+      return; // bad hex → skip silently
+    }
+
+    try {
+      if (widget.mode == 'rfcomm') {
+        await widget.device.sendRfcommData(bytes);
+      } else {
+        await _sendBytes(bytes);
+      }
+    } catch (_) {
+      // silently skip polling errors
+    }
+  }
+
+  /// Stop periodic polling.
+  void _stopAutoRead() {
+    _readTimer?.cancel();
+    _readTimer = null;
+    _autoReadEnabled = false;
+    if (mounted) setState(() {});
+  }
+
+  void _toggleAutoRead() {
+    if (_autoReadEnabled) {
+      _stopAutoRead();
+    } else {
+      _startAutoRead();
     }
   }
 
@@ -528,6 +578,7 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
 
   @override
   void dispose() {
+    _readTimer?.cancel();
     _dataSubscription?.cancel();
     _hexController.dispose();
     _textController.dispose();
@@ -610,13 +661,16 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
         : log.isSent
             ? Colors.blue
             : Colors.green.shade700;
-    final prefix = log.isError ? 'ERR' : log.isSent ? 'SEND' : 'RECV';
+    final prefix =
+        log.isError ? 'ERR' : log.isSent ? 'SEND' : 'RECV';
 
     String text;
     try {
       text = utf8.decode(log.data);
     } catch (_) {
-      text = log.data.map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(' ');
+      text = log.data
+          .map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}')
+          .join(' ');
     }
 
     return Padding(
@@ -679,6 +733,33 @@ class _DataCommunicationPageState extends State<DataCommunicationPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // ─── Polling toggle ─────────────────────────────────────────
+            if (widget.mode == 'rfcomm')
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  children: [
+                    Icon(Icons.loop,
+                        size: 16,
+                        color: _autoReadEnabled ? Colors.green : Colors.grey),
+                    const SizedBox(width: 4),
+                    Text(
+                      '轮询发送 HEX',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: _autoReadEnabled ? Colors.green : Colors.grey,
+                      ),
+                    ),
+                    const Spacer(),
+                    Switch(
+                      value: _autoReadEnabled,
+                      onChanged: (_) => _toggleAutoRead(),
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ],
+                ),
+              ),
             // Hex input row
             Row(
               children: [
