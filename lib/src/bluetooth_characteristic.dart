@@ -81,57 +81,69 @@ class BluetoothCharacteristic {
   }
 
   /// 读取特征值。
+  ///
+  /// 入队执行，保证与同设备其他 GATT 操作串行，避免 GATT_BUSY (133)。
   Future<Uint8List> read({int timeout = 15}) async {
-    final value = await FlutterBluetooth.instance._readCharacteristic(
-      remoteId: remoteId,
-      primaryServiceUuid: primaryServiceUuid,
-      serviceUuid: serviceUuid,
-      characteristicUuid: characteristicUuid,
-      instanceId: instanceId,
-      timeout: timeout,
-    );
-    _lastValue = value;
-    _lastValueController.add(value);
-    _onValueReceivedController.add(value);
-    return value;
+    return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
+      final value = await FlutterBluetooth.instance._readCharacteristic(
+        remoteId: remoteId,
+        primaryServiceUuid: primaryServiceUuid,
+        serviceUuid: serviceUuid,
+        characteristicUuid: characteristicUuid,
+        instanceId: instanceId,
+        timeout: timeout,
+      );
+      _lastValue = value;
+      _lastValueController.add(value);
+      _onValueReceivedController.add(value);
+      return value;
+    });
   }
 
   /// 向特征写入值。
+  ///
+  /// 入队执行，保证与同设备其他 GATT 操作串行，避免 GATT_BUSY (133)。
   Future<void> write(
     List<int> value, {
     bool withoutResponse = false,
     int timeout = 15,
   }) async {
-    await FlutterBluetooth.instance._writeCharacteristic(
-      remoteId: remoteId,
-      primaryServiceUuid: primaryServiceUuid,
-      serviceUuid: serviceUuid,
-      characteristicUuid: characteristicUuid,
-      instanceId: instanceId,
-      value: value,
-      withoutResponse: withoutResponse,
-      timeout: timeout,
-    );
+    return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
+      await FlutterBluetooth.instance._writeCharacteristic(
+        remoteId: remoteId,
+        primaryServiceUuid: primaryServiceUuid,
+        serviceUuid: serviceUuid,
+        characteristicUuid: characteristicUuid,
+        instanceId: instanceId,
+        value: value,
+        withoutResponse: withoutResponse,
+        timeout: timeout,
+      );
+    });
   }
 
   /// 启用或禁用通知/指示。
+  ///
+  /// 入队执行，保证与同设备其他 GATT 操作串行，避免 GATT_BUSY (133)。
   Future<bool> setNotifyValue(
     bool notify, {
     int timeout = 15,
     bool forceIndications = false,
   }) async {
-    final result = await FlutterBluetooth.instance._setNotifyValue(
-      remoteId: remoteId,
-      primaryServiceUuid: primaryServiceUuid,
-      serviceUuid: serviceUuid,
-      characteristicUuid: characteristicUuid,
-      instanceId: instanceId,
-      enable: notify,
-      forceIndications: forceIndications,
-      timeout: timeout,
-    );
-    _isNotifying = result;
-    return result;
+    return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
+      final result = await FlutterBluetooth.instance._setNotifyValue(
+        remoteId: remoteId,
+        primaryServiceUuid: primaryServiceUuid,
+        serviceUuid: serviceUuid,
+        characteristicUuid: characteristicUuid,
+        instanceId: instanceId,
+        enable: notify,
+        forceIndications: forceIndications,
+        timeout: timeout,
+      );
+      _isNotifying = result;
+      return result;
+    });
   }
 
   void _updateValue(Uint8List value) {

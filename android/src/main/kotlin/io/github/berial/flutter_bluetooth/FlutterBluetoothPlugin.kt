@@ -44,9 +44,14 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var bleManager: BleManager
     private lateinit var classicManager: ClassicBluetoothManager
     private lateinit var rfcommManager: RfcommManager
+    private lateinit var pairingRequestManager: PairingRequestManager
 
     // 已连接的 GATT 客户端：remoteId -> BluetoothGatt
     private val connectedGatts = mutableMapOf<String, BluetoothGatt>()
+
+    // 日志级别（0=none,1=error,2=warning,3=info,4=debug,5=verbose）
+    @Volatile
+    private var logLevel: Int = 2
 
     // 适配器状态广播接收器
     private val adapterStateReceiver = object : BroadcastReceiver() {
@@ -66,6 +71,39 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 sendEvent(mapOf(
                     "type" to "adapterStateChanged",
                     "state" to stateStr
+                ))
+            }
+        }
+    }
+
+    // 绑定状态广播接收器 — 推送配对状态变化
+    private val bondStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
+                val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                } ?: return
+
+                val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)
+                val prevState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.BOND_NONE)
+                val stateStr = when (state) {
+                    BluetoothDevice.BOND_BONDING -> "bonding"
+                    BluetoothDevice.BOND_BONDED -> "bonded"
+                    else -> "none"
+                }
+                log(4, "bondStateChanged ${device.address}: $prevState -> $state")
+                sendEvent(mapOf(
+                    "type" to "bondStateChanged",
+                    "remoteId" to (device.address ?: ""),
+                    "bondState" to stateStr,
+                    "prevBondState" to when (prevState) {
+                        BluetoothDevice.BOND_BONDING -> "bonding"
+                        BluetoothDevice.BOND_BONDED -> "bonded"
+                        else -> "none"
+                    }
                 ))
             }
         }
@@ -94,10 +132,15 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         bleManager = BleManager(context, bluetoothAdapter, bluetoothManager!!, ::sendEvent, ::onDeviceDisconnected)
         classicManager = ClassicBluetoothManager(context, bluetoothAdapter, ::sendEvent)
         rfcommManager = RfcommManager(bluetoothAdapter, ::sendEvent, ::onRfcommDisconnected)
+        pairingRequestManager = PairingRequestManager(context, ::sendEvent)
 
         // 注册适配器状态接收器
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        context.registerReceiver(adapterStateReceiver, filter)
+        val adapterFilter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        context.registerReceiver(adapterStateReceiver, adapterFilter)
+
+        // 注册绑定状态接收器
+        val bondFilter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        context.registerReceiver(bondStateReceiver, bondFilter)
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -105,16 +148,33 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         eventChannel.setStreamHandler(null)
         bleManager.stopScan()
         classicManager.stopScan()
-        rfcommManager.disconnectAll()
+        rfcommManager.dispose()
+        pairingRequestManager.dispose()
         connectedGatts.values.forEach { it.close() }
         connectedGatts.clear()
         scope.cancel()
-        try {
-            context.unregisterReceiver(adapterStateReceiver)
-        } catch (_: Exception) {}
+        try { context.unregisterReceiver(adapterStateReceiver) } catch (_: Exception) {}
+        try { context.unregisterReceiver(bondStateReceiver) } catch (_: Exception) {}
     }
 
     // ─── 方法通道处理器 ──────────────────────────────────────────────────
+
+    /** 检查是否拥有蓝牙连接权限（Android 12+ 需要 BLUETOOTH_CONNECT）。 */
+    private fun hasBluetoothConnectPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return ContextCompat.checkSelfPermission(
+            context, Manifest.permission.BLUETOOTH_CONNECT
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /** 权限预检：若无权限返回 true 并通过 result 报错。 */
+    private fun checkPermission(result: MethodChannel.Result): Boolean {
+        if (!hasBluetoothConnectPermission()) {
+            result.error("PERMISSION_DENIED", "BLUETOOTH_CONNECT permission not granted", null)
+            return false
+        }
+        return true
+    }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
@@ -122,6 +182,8 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 "isSupported" -> result.success(isBluetoothSupported())
                 "getAdapterName" -> result.success(getAdapterName())
                 "turnOn" -> handleTurnOn(call, result)
+                "turnOff" -> handleTurnOff(result)
+                "setLogLevel" -> handleSetLogLevel(call, result)
                 "startScan" -> handleStartScan(call, result)
                 "stopScan" -> handleStopScan(result)
                 "getSystemDevices" -> handleGetSystemDevices(call, result)
@@ -145,6 +207,15 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 "sendRfcommData" -> handleSendRfcommData(call, result)
                 "disconnectRfcomm" -> handleDisconnectRfcomm(call, result)
                 "isRfcommConnected" -> handleIsRfcommConnected(call, result)
+                "readRfcommData" -> handleReadRfcommData(call, result)
+                // RFCOMM 服务器
+                "startServer" -> handleStartServer(call, result)
+                "stopServer" -> handleStopServer(result)
+                "isServerRunning" -> result.success(rfcommManager.isServerRunning())
+                // 配对请求处理
+                "enablePairingRequestHandling" -> handleEnablePairingRequestHandling(result)
+                "disablePairingRequestHandling" -> handleDisablePairingRequestHandling(result)
+                "respondPairingRequest" -> handleRespondPairingRequest(call, result)
                 else -> result.notImplemented()
             }
         } catch (e: Exception) {
@@ -166,6 +237,24 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         if (bluetoothAdapter?.isEnabled == false) {
             bluetoothAdapter?.enable()
         }
+        result.success(null)
+    }
+
+    private fun handleTurnOff(result: MethodChannel.Result) {
+        if (bluetoothAdapter?.isEnabled == true) {
+            try {
+                bluetoothAdapter?.disable()
+            } catch (e: SecurityException) {
+                result.error("SECURITY", "Permission denied: ${e.message}", null)
+                return
+            }
+        }
+        result.success(null)
+    }
+
+    private fun handleSetLogLevel(call: MethodCall, result: MethodChannel.Result) {
+        val level = call.argument<Int>("level") ?: 2
+        logLevel = level.coerceIn(0, 5)
         result.success(null)
     }
 
@@ -230,9 +319,8 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             result.error("DEVICE_NOT_FOUND", "Device not found: $remoteId", null); return
         }
 
-        scope.launch {
-            bleManager.connect(device, autoConnect, result, ::onDeviceConnected, desiredMtu = mtu)
-        }
+        // R3: bleManager.connect 内部已 scope.launch，无需外层再 launch
+        bleManager.connect(device, autoConnect, result, ::onDeviceConnected, desiredMtu = mtu)
     }
 
     private fun handleDisconnect(call: MethodCall, result: MethodChannel.Result) {
@@ -269,15 +357,75 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private fun handleCreateBond(call: MethodCall, result: MethodChannel.Result) {
+        if (!checkPermission(result)) return
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
+        val pin = call.argument<String>("pin")  // 可选：Dart 端预设 PIN
+
         val device = bluetoothAdapter?.getRemoteDevice(remoteId)
-        if (device != null) {
+        if (device == null) {
+            result.error("DEVICE_NOT_FOUND", "Device not found: $remoteId", null)
+            return
+        }
+
+        // 若 Dart 端传入了 PIN，启用配对请求处理并预设响应
+        if (pin != null) {
+            pairingRequestManager.enable()
+            // 注意：此处仅启用监听；实际 setPin 在收到 PAIRING_REQUEST 广播后
+            // 由 Dart 端 pairingRequest 事件回调调用 respondPairingRequest 完成，
+            // 或由 Dart 端在 createBond 调用前自行 listen 并响应。
+        }
+
+        try {
             val success = device.createBond()
             result.success(success)
-        } else {
-            result.error("DEVICE_NOT_FOUND", "Device not found: $remoteId", null)
+        } catch (e: SecurityException) {
+            result.error("CREATE_BOND_FAILED", e.message, null)
+        }
+    }
+
+    // ─── 配对请求处理 ────────────────────────────────────────────────────
+
+    private fun handleEnablePairingRequestHandling(result: MethodChannel.Result) {
+        val success = pairingRequestManager.enable()
+        result.success(success)
+    }
+
+    private fun handleDisablePairingRequestHandling(result: MethodChannel.Result) {
+        pairingRequestManager.disable()
+        result.success(null)
+    }
+
+    /**
+     * 响应配对请求。
+     * 参数：
+     * - remoteId: 设备 MAC
+     * - responseType: "pin" 或 "confirmation"
+     * - pin: String（仅 responseType == "pin" 时使用）
+     * - confirm: Boolean（仅 responseType == "confirmation" 时使用）
+     */
+    private fun handleRespondPairingRequest(call: MethodCall, result: MethodChannel.Result) {
+        if (!checkPermission(result)) return
+        val remoteId = call.argument<String>("remoteId") ?: run {
+            result.error("INVALID_ARG", "remoteId required", null); return
+        }
+        val responseType = call.argument<String>("responseType") ?: run {
+            result.error("INVALID_ARG", "responseType required", null); return
+        }
+
+        when (responseType) {
+            "pin" -> {
+                val pin = call.argument<String>("pin") ?: run {
+                    result.error("INVALID_ARG", "pin required for pin response", null); return
+                }
+                result.success(pairingRequestManager.respondPin(remoteId, pin))
+            }
+            "confirmation" -> {
+                val confirm = call.argument<Boolean>("confirm") ?: true
+                result.success(pairingRequestManager.respondConfirmation(remoteId, confirm))
+            }
+            else -> result.error("INVALID_ARG", "Unknown responseType: $responseType", null)
         }
     }
 
@@ -353,7 +501,8 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             result.error("INVALID_ARG", "characteristicUuid required", null); return
         }
         val enable = call.argument<Boolean>("enable") ?: false
-        bleManager.setNotifyValue(remoteId, serviceUuid, characteristicUuid, enable, result)
+        val forceIndications = call.argument<Boolean>("forceIndications") ?: false
+        bleManager.setNotifyValue(remoteId, serviceUuid, characteristicUuid, enable, forceIndications, result)
     }
 
     private fun handleReadDescriptor(call: MethodCall, result: MethodChannel.Result) {
@@ -393,12 +542,14 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     // ─── BleManager 回调 ────────────────────────────────────────────────
 
-    private fun onDeviceDisconnected(remoteId: String) {
+    private fun onDeviceDisconnected(remoteId: String, status: Int, statusString: String) {
         connectedGatts.remove(remoteId)
         sendEvent(mapOf(
             "type" to "connectionStateChanged",
             "remoteId" to remoteId,
-            "state" to "disconnected"
+            "state" to "disconnected",
+            "disconnectReasonCode" to status,
+            "disconnectReasonString" to statusString
         ))
     }
 
@@ -424,6 +575,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     // ─── RFCOMM（经典蓝牙 SPP）──────────────────────────────────────────
 
     private fun handleConnectRfcomm(call: MethodCall, result: MethodChannel.Result) {
+        if (!checkPermission(result)) return
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
@@ -443,20 +595,23 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private fun handleSendRfcommData(call: MethodCall, result: MethodChannel.Result) {
+        if (!checkPermission(result)) return
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
-        val data = call.argument<ByteArray>("data") ?: run {
+        val data = call.argument<List<Int>>("data")?.map { it.toByte() }?.toByteArray() ?: run {
             result.error("INVALID_ARG", "data required", null); return
+        }
+
+        // R8: 未连接返回 error（可区分），写入失败返回 success(false)
+        if (!rfcommManager.isConnected(remoteId)) {
+            result.error("NOT_CONNECTED", "RFCOMM not connected: $remoteId", null)
+            return
         }
 
         scope.launch {
             val success = rfcommManager.sendData(remoteId, data)
-            if (success) {
-                result.success(true)
-            } else {
-                result.error("RFCOMM_SEND_FAILED", "Device not connected or write failed", null)
-            }
+            result.success(success)
         }
     }
 
@@ -475,11 +630,71 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         result.success(rfcommManager.isConnected(remoteId))
     }
 
+    private fun handleReadRfcommData(call: MethodCall, result: MethodChannel.Result) {
+        val remoteId = call.argument<String>("remoteId") ?: run {
+            result.error("INVALID_ARG", "remoteId required", null); return
+        }
+        val maxSize = call.argument<Int>("maxSize") ?: 1024
+        scope.launch {
+            val data = rfcommManager.readDataOnce(remoteId, maxSize)
+            if (data != null) {
+                // 直接返回 ByteArray，StandardMessageCodec 编码为 Dart Uint8List
+                result.success(data)
+            } else {
+                result.success(null)
+            }
+        }
+    }
+
+    // ─── RFCOMM 服务器模式 ───────────────────────────────────────────────
+
+    private fun handleStartServer(call: MethodCall, result: MethodChannel.Result) {
+        if (!checkPermission(result)) return
+        val uuidString = call.argument<String>("uuid")
+        val name = call.argument<String>("name") ?: "FlutterBluetooth"
+        rfcommManager.startServer(uuidString, name) { success, error ->
+            if (success) {
+                result.success(true)
+            } else {
+                result.error("SERVER_START_FAILED", error ?: "Unknown error", null)
+            }
+        }
+    }
+
+    private fun handleStopServer(result: MethodChannel.Result) {
+        rfcommManager.stopServer()
+        result.success(null)
+    }
+
     // ─── 辅助方法 ──────────────────────────────────────────────────────
 
     private fun sendEvent(event: Map<String, Any?>) {
         scope.launch(Dispatchers.Main) {
             eventSink?.success(event)
+        }
+    }
+
+    /**
+     * 内部日志输出。当日志级别达到 [level] 时，通过 `logs` 事件推送到 Dart 端。
+     * 级别：0=none,1=error,2=warning,3=info,4=debug,5=verbose
+     */
+    private fun log(level: Int, message: String) {
+        if (level > logLevel) return
+        val levelStr = when (level) {
+            1 -> "ERROR"
+            2 -> "WARN"
+            3 -> "INFO"
+            4 -> "DEBUG"
+            5 -> "VERBOSE"
+            else -> "INFO"
+        }
+        scope.launch(Dispatchers.Main) {
+            eventSink?.success(mapOf(
+                "type" to "log",
+                "level" to levelStr,
+                "message" to message,
+                "timestamp" to System.currentTimeMillis()
+            ))
         }
     }
 

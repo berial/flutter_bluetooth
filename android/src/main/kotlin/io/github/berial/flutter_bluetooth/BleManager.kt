@@ -30,13 +30,16 @@ class BleManager(
     private val bluetoothAdapter: BluetoothAdapter?,
     private val bluetoothManager: BluetoothManager,
     private val sendEvent: (Map<String, Any?>) -> Unit,
-    private val onDeviceDisconnected: (String) -> Unit
+    private val onDeviceDisconnected: (String, Int, String) -> Unit
 ) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var leScanner: BluetoothLeScanner? = null
 
     // 活跃的 GATT 连接：remoteId -> BluetoothGatt
     private val gattMap = ConcurrentHashMap<String, BluetoothGatt>()
+
+    // 设备的 autoConnect 标记：用于断开时决定是否跳过 gatt.close() 保留重连句柄
+    private val autoConnectMap = ConcurrentHashMap<String, Boolean>()
 
     // 等待 GATT 回调的待处理操作
     private val pendingCallbacks = ConcurrentHashMap<String, MethodChannel.Result>()
@@ -64,6 +67,9 @@ class BleManager(
     private val pendingChunkedWrites = ConcurrentHashMap<String, ChunkedWrite>()
 
     // ─── BLE 扫描 ──────────────────────────────────────────────────────
+
+    // I3: 扫描结果去重 — remoteId -> 广播包指纹，相同指纹直接丢弃
+    private val advSeen = ConcurrentHashMap<String, String>()
 
     private val bleScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -100,8 +106,15 @@ class BleManager(
                 }
             }
 
+            val address = device.address ?: return
+
+            // I3: 去重 — 相同广播包指纹直接丢弃，避免重复广播刷屏
+            val advHex = buildAdvFingerprint(name, serviceUuids, manufacturerData, serviceData, record.txPowerLevel)
+            if (advSeen[address] == advHex) return
+            advSeen[address] = advHex
+
             val deviceMap = mapOf(
-                "remoteId" to (device.address ?: ""),
+                "remoteId" to address,
                 "platformName" to name,
                 "advName" to name,
                 "type" to "ble"
@@ -128,21 +141,73 @@ class BleManager(
         override fun onScanFailed(errorCode: Int) {
             android.util.Log.e("BleManager", "BLE scan failed with error: $errorCode")
             isScanning = false
+            scanHandler.removeCallbacks(scanTimeoutRunnable)
             sendEvent(mapOf(
                 "type" to "scanError",
+                "source" to "ble",
                 "errorCode" to errorCode
+            ))
+            // R12: 扫描失败后补推 scanStopped，重置 Dart 端 _isBleScanning
+            sendEvent(mapOf(
+                "type" to "scanStopped",
+                "source" to "ble"
             ))
         }
     }
 
+    /** I3: 构造广播包指纹（name + serviceUuids + manufacturerData + serviceData + txPower）。 */
+    private fun buildAdvFingerprint(
+        name: String,
+        serviceUuids: List<String>,
+        manufacturerData: Map<Int, List<Int>>,
+        serviceData: Map<String, List<Int>>,
+        txPower: Int?
+    ): String {
+        val sb = StringBuilder()
+        sb.append(name).append('|')
+        sb.append(serviceUuids.joinToString(",")).append('|')
+        manufacturerData.toSortedMap().forEach { (k, v) -> sb.append(k).append(':').append(v.joinToString(",")).append(';') }
+        sb.append('|')
+        serviceData.toSortedMap().forEach { (k, v) -> sb.append(k).append(':').append(v.joinToString(",")).append(';') }
+        sb.append('|').append(txPower ?: -128)
+        return sb.toString()
+    }
+
+    @Volatile
     private var isScanning = false
+    private val scanHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** BLE 扫描原生兜底超时（毫秒）。Dart 端 crash 时防止永久扫描。 */
+    private val scanTimeoutMs = 120_000L
+
+    private val scanTimeoutRunnable = Runnable {
+        if (isScanning) {
+            android.util.Log.w("BleManager", "BLE scan native timeout, force stop")
+            stopScan()
+        }
+    }
 
     fun startScan(scanModeStr: String, filter: ScanFilter) {
-        if (isScanning) return
+        if (isScanning) {
+            // 重复扫描时推送 scanError，与 Dart 端契约一致
+            sendEvent(mapOf(
+                "type" to "scanError",
+                "source" to "ble",
+                "errorCode" to -1,
+                "message" to "BLE scan already in progress"
+            ))
+            return
+        }
 
         leScanner = bluetoothAdapter?.bluetoothLeScanner
         if (leScanner == null) {
             android.util.Log.w("BleManager", "BLE scanner not available")
+            sendEvent(mapOf(
+                "type" to "scanError",
+                "source" to "ble",
+                "errorCode" to -1,
+                "message" to "BLE scanner not available"
+            ))
             return
         }
 
@@ -153,9 +218,13 @@ class BleManager(
             else -> ScanSettings.SCAN_MODE_LOW_LATENCY
         }
 
-        val settings = ScanSettings.Builder()
-            .setScanMode(scanMode)
-            .build()
+        // I2: Android 8+ 加 setPhy + setLegacy，支持双 PHY 扫描与扩展广播
+        val settingsBuilder = ScanSettings.Builder().setScanMode(scanMode)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            settingsBuilder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+            settingsBuilder.setLegacy(false)
+        }
+        val settings = settingsBuilder.build()
 
         // 构建原生扫描过滤器
         val nativeFilters = mutableListOf<LeScanFilter>()
@@ -173,24 +242,39 @@ class BleManager(
         }
 
         isScanning = true
+        advSeen.clear()
         try {
             leScanner?.startScan(
                 if (nativeFilters.isEmpty()) null else nativeFilters,
                 settings,
                 bleScanCallback
             )
+            // N2: 原生兜底超时，防止 Dart 端 crash 后永久扫描
+            scanHandler.postDelayed(scanTimeoutRunnable, scanTimeoutMs)
         } catch (e: SecurityException) {
             isScanning = false
             android.util.Log.e("BleManager", "Bluetooth scan permission denied: ${e.message}")
+            sendEvent(mapOf(
+                "type" to "scanError",
+                "source" to "ble",
+                "errorCode" to -1,
+                "message" to "Permission denied: ${e.message}"
+            ))
         }
     }
 
     fun stopScan() {
         if (!isScanning) return
         isScanning = false
+        scanHandler.removeCallbacks(scanTimeoutRunnable)
         try {
             leScanner?.stopScan(bleScanCallback)
         } catch (e: SecurityException) {}
+        // I4: 推送 scanStopped 事件，Dart 端统一处理（与经典蓝牙侧一致）
+        sendEvent(mapOf(
+            "type" to "scanStopped",
+            "source" to "ble"
+        ))
     }
 
     // ─── 连接管理 ────────────────────────────────────────────────────────
@@ -199,8 +283,14 @@ class BleManager(
                 onConnected: (String, BluetoothGatt?) -> Unit, desiredMtu: Int? = null) {
         scope.launch {
             try {
-                val gatt = device.connectGatt(context, autoConnect, gattCallback)
+                // B1: 显式传 TRANSPORT_LE，部分外设默认 AUTO 传输下连接失败
+                // B8: 先 connectGatt 再 put，避免异常时 gattMap 存入 null
+                val gatt = device.connectGatt(
+                    context, autoConnect, gattCallback,
+                    BluetoothDevice.TRANSPORT_LE
+                )
                 gattMap[device.address] = gatt
+                autoConnectMap[device.address] = autoConnect
 
                 if (desiredMtu != null && desiredMtu > DEFAULT_MTU) {
                     // 延迟连接结果，等待 MTU 协商完成
@@ -226,11 +316,25 @@ class BleManager(
                 // 收到 STATE_DISCONNECTED 后执行，避免竞态条件
             } catch (e: SecurityException) {}
         }
+        // N3: 用户主动 disconnect = 终止 autoConnect，显式 close 释放句柄
+        // 否则 autoConnect 设备跳过 close 会导致 gatt 泄漏（再次 connect 同一设备时旧 gatt 孤儿）
+        autoConnectMap.remove(remoteId)
         mtuMap.remove(remoteId)
         pendingConnects.remove(remoteId)
+        // B6: 清理该设备的所有 pendingCallbacks，避免 Future 挂死
+        val prefix = "${remoteId}_"
+        val keysToFail = pendingCallbacks.keys.filter { it.startsWith(prefix) || it == "connect_$remoteId" }
+        for (key in keysToFail) {
+            pendingCallbacks.remove(key)?.error("DISCONNECTED", "Device disconnected before operation completed", null)
+            // R6: 取消关联的超时 Job
+            writeTimeoutJobs.remove(key)?.cancel()
+        }
         // 移除该设备的待处理分包写入
         pendingChunkedWrites.keys.filter { it.startsWith("${remoteId}_") }
-            .forEach { pendingChunkedWrites.remove(it) }
+            .forEach {
+                val cw = pendingChunkedWrites.remove(it)
+                cw?.result?.error("DISCONNECTED", "Device disconnected during chunked write", null)
+            }
         // 通知 Dart 侧 MTU 已重置
         sendEvent(mapOf(
             "type" to "mtuChanged",
@@ -247,10 +351,13 @@ class BleManager(
             result.error("NOT_CONNECTED", "Device not connected", null)
             return
         }
-        pendingCallbacks["discover_$remoteId"] = result
+        val key = "discover_$remoteId"
+        pendingCallbacks[key] = result
         try {
             gatt.discoverServices()
         } catch (e: SecurityException) {
+            // U1: 清理 pendingCallbacks，避免残留已回复的 result
+            pendingCallbacks.remove(key)
             result.error("SECURITY", e.message, null)
         }
     }
@@ -261,10 +368,13 @@ class BleManager(
             result.error("NOT_CONNECTED", "Device not connected", null)
             return
         }
-        pendingCallbacks["readRssi_$remoteId"] = result
+        val key = "readRssi_$remoteId"
+        pendingCallbacks[key] = result
         try {
             gatt.readRemoteRssi()
         } catch (e: SecurityException) {
+            // U1: 清理 pendingCallbacks，避免残留已回复的 result
+            pendingCallbacks.remove(key)
             result.error("SECURITY", e.message, null)
         }
     }
@@ -275,10 +385,13 @@ class BleManager(
             result.error("NOT_CONNECTED", "Device not connected", null)
             return
         }
-        pendingCallbacks["mtu_$remoteId"] = result
+        val key = "mtu_$remoteId"
+        pendingCallbacks[key] = result
         try {
             gatt.requestMtu(desiredMtu)
         } catch (e: SecurityException) {
+            // U1: 清理 pendingCallbacks，避免残留已回复的 result
+            pendingCallbacks.remove(key)
             result.error("SECURITY", e.message, null)
         }
     }
@@ -295,10 +408,13 @@ class BleManager(
             result.error("CHAR_NOT_FOUND", "Characteristic not found", null)
             return
         }
-        pendingCallbacks["read_${remoteId}_$characteristicUuid"] = result
+        val key = "read_${remoteId}_$characteristicUuid"
+        pendingCallbacks[key] = result
         try {
             gatt.readCharacteristic(characteristic)
         } catch (e: SecurityException) {
+            // U1: 清理 pendingCallbacks，避免残留已回复的 result
+            pendingCallbacks.remove(key)
             result.error("SECURITY", e.message, null)
         }
     }
@@ -319,11 +435,16 @@ class BleManager(
 
         // 根据协商的 MTU 计算最大有效载荷
         val currentMtu = mtuMap[remoteId] ?: DEFAULT_MTU
-        val maxPayload = currentMtu - 3 // ATT 头部 = 3 字节
+        // Q3: MTU 下限保护，避免异常值导致 maxPayload ≤ 0 引发分包死循环
+        val maxPayload = (currentMtu - 3).coerceAtLeast(20) // ATT 头部 = 3 字节，最小 20
+
+        // P2: withoutResponse 模式不触发 onCharacteristicWrite 回调，分包队列无法推进
+        // 强制 withoutResponse + 大包场景退化为 withResponse，避免死锁
+        val effectiveWithoutResponse = withoutResponse && value.size <= maxPayload
 
         if (value.size <= maxPayload) {
             // 数据可放入单个包 — 直接写入
-            writeSingleChunk(gatt, characteristic, value, withoutResponse, remoteId, characteristicUuid, result)
+            writeSingleChunk(gatt, characteristic, value, effectiveWithoutResponse, remoteId, characteristicUuid, result)
         } else {
             // 拆分为多个分包并顺序写入
             val chunks = value.toList().chunked(maxPayload).map { it.toByteArray() }.toMutableList()
@@ -335,12 +456,12 @@ class BleManager(
                 chunks = chunks,
                 serviceUuid = serviceUuid,
                 characteristicUuid = characteristicUuid,
-                withoutResponse = withoutResponse,
+                withoutResponse = effectiveWithoutResponse,
                 result = result
             )
 
             // 写入第一个分包
-            writeSingleChunk(gatt, characteristic, firstChunk, withoutResponse, remoteId, characteristicUuid, null)
+            writeSingleChunk(gatt, characteristic, firstChunk, effectiveWithoutResponse, remoteId, characteristicUuid, null)
         }
     }
 
@@ -353,33 +474,95 @@ class BleManager(
         characteristicUuid: String,
         result: MethodChannel.Result?
     ) {
-        characteristic.value = value
-        characteristic.writeType = if (withoutResponse)
+        val writeType = if (withoutResponse)
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         else
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
-        if (withoutResponse) {
+        // B2: Android 13+ (API 33) 用新 API writeCharacteristic(char, value, writeType)
+        val writeOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             try {
-                gatt.writeCharacteristic(characteristic)
-                result?.success(null)
+                val rv = gatt.writeCharacteristic(characteristic, value, writeType)
+                if (rv == android.bluetooth.BluetoothStatusCodes.SUCCESS) {
+                    true
+                } else {
+                    // N5: 返回非 SUCCESS 时显式报错，避免 Dart 端 Future 挂死
+                    result?.error("GATT_ERROR", "writeCharacteristic returned $rv", null)
+                    failChunkedWrite(gatt, remoteId, characteristicUuid, "rv=$rv")
+                    false
+                }
             } catch (e: SecurityException) {
                 result?.error("SECURITY", e.message, null)
+                // B9: 异常时清理整个 ChunkedWrite
+                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "SecurityException")
+                false
+            } catch (e: Exception) {
+                result?.error("GATT_ERROR", e.message, null)
+                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "Exception")
+                false
             }
         } else {
-            if (result != null) {
-                pendingCallbacks["write_${remoteId}_$characteristicUuid"] = result
-            }
+            // T1: 将「正常返回 false」与「抛异常」两条路径互斥处理，
+            // 避免重复调用 result.error / failChunkedWrite
+            @Suppress("DEPRECATION")
             try {
-                gatt.writeCharacteristic(characteristic)
+                characteristic.value = value
+                characteristic.writeType = writeType
+                val ok = gatt.writeCharacteristic(characteristic)
+                if (!ok) {
+                    // S1: gatt.writeCharacteristic 返回 false 时（GATT 内部忙/特征不支持），
+                    // 显式报错 + 清理 ChunkedWrite，避免 Dart 端 Future 挂死
+                    result?.error("GATT_ERROR", "writeCharacteristic returned false", null)
+                    failChunkedWrite(gatt, remoteId, characteristicUuid, "writeCharacteristic returned false")
+                }
+                ok
             } catch (e: SecurityException) {
                 result?.error("SECURITY", e.message, null)
+                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "SecurityException")
+                false
+            } catch (e: Exception) {
+                result?.error("GATT_ERROR", e.message, null)
+                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "Exception")
+                false
             }
+        }
+
+        if (!writeOk) return
+
+        // R2/R10: withoutResponse 模式立即返回（Android 不保证触发 onCharacteristicWrite，
+        // 分包场景等回调会卡死）；withResponse 模式等待回调 + 超时兜底
+        if (withoutResponse) {
+            result?.success(null)
+        } else if (result != null) {
+            val key = "write_${remoteId}_$characteristicUuid"
+            pendingCallbacks[key] = result
+            val writeTimeoutMs = 15_000L
+            // R6: 保存 Job 以便回调成功时取消，避免协程泄漏
+            val timeoutJob = scope.launch {
+                delay(writeTimeoutMs)
+                val pending = pendingCallbacks.remove(key)
+                pending?.error("TIMEOUT", "Write characteristic timed out", null)
+            }
+            // 关联存储 timeoutJob，onCharacteristicWrite 时取消
+            writeTimeoutJobs[key] = timeoutJob
+        }
+    }
+
+    /** R6: 存储 writeCharacteristic 的超时 Job，成功回调时取消避免协程泄漏。 */
+    private val writeTimeoutJobs = ConcurrentHashMap<String, Job>()
+
+    /** B9: 写入异常时清理整个 ChunkedWrite 队列并报错。 */
+    private fun failChunkedWrite(gatt: BluetoothGatt, remoteId: String, characteristicUuid: String, msg: String) {
+        val writeKey = "${remoteId}_${characteristicUuid}"
+        val cw = pendingChunkedWrites.remove(writeKey)
+        if (cw != null) {
+            try { cw.result.error("GATT_ERROR", "Chunked write failed: $msg", null) } catch (_: Exception) {}
         }
     }
 
     fun setNotifyValue(remoteId: String, serviceUuid: String,
                        characteristicUuid: String, enable: Boolean,
+                       forceIndications: Boolean,
                        result: MethodChannel.Result) {
         val gatt = gattMap[remoteId]
         if (gatt == null) {
@@ -392,25 +575,72 @@ class BleManager(
             return
         }
 
-        // 启用本地通知
+        val properties = characteristic.properties
+        val supportsNotify = (properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+        val supportsIndicate = (properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+
+        // B4: 选择描述符值
+        // - enable=false → DISABLE
+        // - forceIndications=true → 必须 INDICATE（不支持则报错）
+        // - 同时支持 notify+indicate → 默认 NOTIFY（与 iOS CoreBluetooth 一致）
+        // - 只支持其中一种 → 用支持的那种
+        val descriptorValue = if (!enable) {
+            BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+        } else {
+            if (forceIndications) {
+                if (!supportsIndicate) {
+                    result.error("UNSUPPORTED", "Characteristic does not support indicate", null)
+                    return
+                }
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            } else if (supportsNotify) {
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            } else if (supportsIndicate) {
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            } else {
+                result.error("UNSUPPORTED", "Characteristic does not support notify or indicate", null)
+                return
+            }
+        }
+
         try {
             val descriptor = characteristic.getDescriptor(
                 UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
             )
-            if (descriptor != null) {
-                descriptor.value = if (enable)
-                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                else
-                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-            }
 
+            // 本地监听开关
             gatt.setCharacteristicNotification(characteristic, enable)
 
             if (descriptor != null) {
-                pendingCallbacks["notify_${remoteId}_$characteristicUuid"] = result
-                gatt.writeDescriptor(descriptor)
+                // B2: Android 13+ 用新 API writeDescriptor(desc, value)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    // N7: Android 13+ 部分 OEM 实现不触发 onDescriptorWrite 回调，
+                    // SUCCESS 后直接 success，避免 Dart 端挂起到 timeout
+                    // R5: enable=false 时返回 false 表示「已关闭通知」
+                    try {
+                        val rv = gatt.writeDescriptor(descriptor, descriptorValue)
+                        if (rv == android.bluetooth.BluetoothStatusCodes.SUCCESS) {
+                            result.success(enable)
+                        } else {
+                            result.error("GATT_ERROR", "writeDescriptor failed: $rv", null)
+                        }
+                    } catch (e: SecurityException) {
+                        result.error("SECURITY", e.message, null)
+                    }
+                } else {
+                    pendingCallbacks["notify_${remoteId}_$characteristicUuid"] = result
+                    @Suppress("DEPRECATION")
+                    try {
+                        descriptor.value = descriptorValue
+                        gatt.writeDescriptor(descriptor)
+                    } catch (e: SecurityException) {
+                        pendingCallbacks.remove("notify_${remoteId}_$characteristicUuid")
+                        result.error("SECURITY", e.message, null)
+                    }
+                }
             } else {
-                result.success(enable)
+                // B7: 无 CCCD 描述符 — 本地监听已开，但未写描述符，返回 false 表示未写
+                result.success(false)
             }
         } catch (e: SecurityException) {
             result.error("SECURITY", e.message, null)
@@ -451,12 +681,28 @@ class BleManager(
             result.error("DESC_NOT_FOUND", "Descriptor not found", null)
             return
         }
-        descriptor.value = value
         pendingCallbacks["writeDesc_${remoteId}_$descriptorUuid"] = result
-        try {
-            gatt.writeDescriptor(descriptor)
-        } catch (e: SecurityException) {
-            result.error("SECURITY", e.message, null)
+        // B2: Android 13+ 用新 API writeDescriptor(desc, value)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                val rv = gatt.writeDescriptor(descriptor, value)
+                if (rv != android.bluetooth.BluetoothStatusCodes.SUCCESS) {
+                    pendingCallbacks.remove("writeDesc_${remoteId}_$descriptorUuid")
+                    result.error("GATT_ERROR", "writeDescriptor failed: $rv", null)
+                }
+            } catch (e: SecurityException) {
+                pendingCallbacks.remove("writeDesc_${remoteId}_$descriptorUuid")
+                result.error("SECURITY", e.message, null)
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            try {
+                descriptor.value = value
+                gatt.writeDescriptor(descriptor)
+            } catch (e: SecurityException) {
+                pendingCallbacks.remove("writeDesc_${remoteId}_$descriptorUuid")
+                result.error("SECURITY", e.message, null)
+            }
         }
     }
 
@@ -497,15 +743,23 @@ class BleManager(
                 val pendingConnect = pendingConnects.remove(address)
 
                 if (pendingConnect != null) {
-                    // 连接时请求了 MTU — 现在发起请求
-                    try {
-                        gatt.requestMtu(pendingConnect.desiredMtu ?: 512)
-                        // 保存连接信息供 onMtuChanged 回调使用
-                        pendingConnects["mtu_pending_$address"] = pendingConnect
-                    } catch (e: SecurityException) {
-                        // MTU 请求失败，仍然报告已连接
-                        pendingConnect.result.success(null)
-                        pendingConnect.onConnected(address, gatt)
+                    // 连接时请求了 MTU — 延迟 350ms 再发起，等待外设主动下发的 MTU 更新完成
+                    // I8: 避免 predelay 期间与外设自动 MTU 更新混淆导致后续 discoverServices 失败
+                    scope.launch {
+                        delay(MTU_REQUEST_PREDELAY_MS)
+                        // N12: predelay 期间用户可能已 disconnect，gatt 已从 gattMap 移除
+                        if (!gattMap.containsKey(address)) {
+                            return@launch
+                        }
+                        try {
+                            gatt.requestMtu(pendingConnect.desiredMtu ?: 512)
+                            // 保存连接信息供 onMtuChanged 回调使用
+                            pendingConnects["mtu_pending_$address"] = pendingConnect
+                        } catch (e: SecurityException) {
+                            // MTU 请求失败，仍然报告已连接
+                            pendingConnect.result.success(null)
+                            pendingConnect.onConnected(address, gatt)
+                        }
                     }
                 } else {
                     val key = "connect_$address"
@@ -517,8 +771,14 @@ class BleManager(
                 mtuMap.remove(address)
                 pendingConnects.remove(address)
                 pendingConnects.remove("mtu_pending_$address")
-                gatt.close()
-                onDeviceDisconnected(address)
+                val isAutoConnect = autoConnectMap[address] == true
+                // I7: autoConnect 设备跳过 gatt.close()，保留句柄供系统后台重连
+                if (!isAutoConnect) {
+                    try { gatt.close() } catch (_: Exception) {}
+                }
+                autoConnectMap.remove(address)
+                // B5: 上报断开原因（status + HCI 状态字符串），便于 Dart 端诊断
+                onDeviceDisconnected(address, status, hciStatusString(status))
             }
         }
 
@@ -578,13 +838,36 @@ class BleManager(
             }
         }
 
-        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic,
-                                          status: Int) {
+        // B3: Android 13+ 新签名 onCharacteristicRead（带 byte[] value）
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            onCharacteristicReadReceived(gatt, characteristic, value, status)
+        }
+
+        // B3: Android 13- 旧签名，委托给新签名
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            onCharacteristicReadReceived(gatt, characteristic, characteristic.value ?: ByteArray(0), status)
+        }
+
+        private fun onCharacteristicReadReceived(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
             val key = "read_${gatt.device.address}_${FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid)}"
             val result = pendingCallbacks.remove(key)
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                val value = characteristic.value?.toList() ?: emptyList<Int>()
-                result?.success(value)
+                result?.success(value.toList())
             } else {
                 result?.error("GATT_ERROR", "Read characteristic failed: $status", null)
             }
@@ -601,14 +884,17 @@ class BleManager(
                 // 发送下一个分包
                 val nextChunk = chunkedWrite.chunks.removeAt(0)
                 val nextChar = findCharacteristic(gatt, chunkedWrite.serviceUuid, chunkedWrite.characteristicUuid)
-                if (nextChar != null) {
-                    writeSingleChunk(gatt, nextChar, nextChunk, chunkedWrite.withoutResponse,
-                        gatt.device.address, chunkedWrite.characteristicUuid, null)
-                } else {
-                    // 特征不可用，清理队列并报错
+                if (nextChar == null) {
+                    // T2: 特征不可用，清理队列并报错后直接 return，避免后续重复 success
                     pendingChunkedWrites.remove(writeKey)
                     chunkedWrite.result.error("GATT_ERROR", "Characteristic not found for chunked write", null)
+                    return
                 }
+                // T2: 写入下一分包；writeSingleChunk 内部失败时 failChunkedWrite 会清理队列并报错
+                writeSingleChunk(gatt, nextChar, nextChunk, chunkedWrite.withoutResponse,
+                    gatt.device.address, chunkedWrite.characteristicUuid, null)
+                // T2: 若 writeSingleChunk 已通过 failChunkedWrite 清理队列（S1 场景），直接 return
+                if (!pendingChunkedWrites.containsKey(writeKey)) return
                 // 如果这是最后一个剩余分包，清理并报告成功
                 if (chunkedWrite.chunks.isEmpty()) {
                     pendingChunkedWrites.remove(writeKey)
@@ -627,6 +913,8 @@ class BleManager(
             // 无分包写入 — 普通单次写入回调
             pendingChunkedWrites.remove(writeKey)
             val key = "write_${gatt.device.address}_$charUuid"
+            // R6: 取消超时协程，避免泄漏
+            writeTimeoutJobs.remove(key)?.cancel()
             val result = pendingCallbacks.remove(key)
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 result?.success(null)
@@ -635,40 +923,86 @@ class BleManager(
             }
         }
 
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            val value = characteristic.value?.toList() ?: emptyList<Int>()
+        // B3: Android 13+ 新签名 onCharacteristicChanged（带 byte[] value）
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            onCharacteristicReceived(gatt, characteristic, value)
+        }
+
+        // B3: Android 13- 旧签名，委托给新签名
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            onCharacteristicReceived(gatt, characteristic, characteristic.value ?: ByteArray(0))
+        }
+
+        private fun onCharacteristicReceived(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
             sendEvent(mapOf(
                 "type" to "characteristicNotified",
                 "remoteId" to gatt.device.address,
                 "serviceUuid" to FlutterBluetoothPlugin.uuidToStandardString(characteristic.service.uuid),
                 "characteristicUuid" to FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid),
-                "value" to value
+                "value" to value.toList()
             ))
         }
 
-        override fun onDescriptorRead(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+        // B3: Android 13+ 新签名 onDescriptorRead（带 byte[] value）
+        override fun onDescriptorRead(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+            value: ByteArray
+        ) {
+            onDescriptorReadReceived(gatt, descriptor, value, status)
+        }
+
+        // B3: Android 13- 旧签名，委托给新签名
+        @Suppress("DEPRECATION")
+        override fun onDescriptorRead(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            onDescriptorReadReceived(gatt, descriptor, descriptor.value ?: ByteArray(0), status)
+        }
+
+        private fun onDescriptorReadReceived(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            value: ByteArray,
+            status: Int
+        ) {
             val key = "readDesc_${gatt.device.address}_${FlutterBluetoothPlugin.uuidToStandardString(descriptor.uuid)}"
             val result = pendingCallbacks.remove(key)
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                val value = descriptor.value?.toList() ?: emptyList<Int>()
-                result?.success(value)
+                result?.success(value.toList())
             } else {
                 result?.error("GATT_ERROR", "Read descriptor failed: $status", null)
             }
         }
 
+        // B10: 先判 status 再 success，避免失败时 Dart 端拿到成功
+        // N7: Android 13+ notify 路径已直接 success，此回调主要服务 Android 13- 的 notify 和所有版本的 writeDescriptor
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             val key = "writeDesc_${gatt.device.address}_${FlutterBluetoothPlugin.uuidToStandardString(descriptor.uuid)}"
-            // 同时检查通知描述符写入
             val characteristicUuid = FlutterBluetoothPlugin.uuidToStandardString(descriptor.characteristic.uuid)
             val notifyKey = "notify_${gatt.device.address}_$characteristicUuid"
 
-            pendingCallbacks.remove(key)?.success(null)
-            val notifyResult = pendingCallbacks.remove(notifyKey)
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                notifyResult?.success(true)
+                pendingCallbacks.remove(key)?.success(null)
+                pendingCallbacks.remove(notifyKey)?.success(true)
             } else {
-                notifyResult?.error("GATT_ERROR", "Write descriptor failed: $status", null)
+                pendingCallbacks.remove(key)?.error("GATT_ERROR", "Write descriptor failed: $status", null)
+                pendingCallbacks.remove(notifyKey)?.error("GATT_ERROR", "Write descriptor failed: $status", null)
             }
         }
     }
@@ -688,7 +1022,24 @@ class BleManager(
         return characteristic.getDescriptor(UUID.fromString(descriptorUuid))
     }
 
+    /** B5: 将 GATT/HCI status 码映射为可读字符串，便于 Dart 端诊断断开原因。 */
+    private fun hciStatusString(status: Int): String = when (status) {
+        BluetoothGatt.GATT_SUCCESS -> "SUCCESS"
+        8 -> "CONNECTION_TIMEOUT"           // HCI 错误码：连接超时
+        19 -> "REMOTE_USER_TERMINATED"      // 远端用户主动断开
+        22 -> "LOCAL_HOST_TERMINATED"       // 本地主机关闭
+        62 -> "CONN_FAIL_ESTABLISH"         // 连接建立失败
+        128 -> "INTERNAL_ERROR"             // Android 蓝牙栈内部错误（常见于连接失败）
+        133 -> "GATT_ERROR"                 // 通用 GATT 错误（常见于连接失败）
+        137 -> "AUTH_FAIL_ENC_KEY_MISSING"  // 认证失败/密钥缺失
+        143 -> "CONN_LMP_TIMEOUT"           // 链路管理协议超时
+        else -> "UNKNOWN($status)"
+    }
+
     companion object {
+        /** 连接后请求 MTU 前的预延迟（毫秒），等待外设主动 MTU 更新完成。 */
+        private const val MTU_REQUEST_PREDELAY_MS = 350L
+
         fun serviceToMap(remoteId: String, service: BluetoothGattService): Map<String, Any?> {
             val characteristics = service.characteristics.map { char ->
                 val properties = char.properties

@@ -30,10 +30,24 @@ class FlutterBluetooth {
   String _adapterName = '';
   String get adapterName => _adapterName;
 
+  // ─── 日志 ──────────────────────────────────────────────────────────────
+
+  LogLevel _logLevel = LogLevel.warning;
+  LogLevel get logLevel => _logLevel;
+
+  final StreamController<String> _logsController =
+      StreamController<String>.broadcast();
+  /// 日志流。受 [setLogLevel] 控制的级别过滤。
+  Stream<String> get logs => _logsController.stream;
+
   // ─── 扫描 ──────────────────────────────────────────────────────────────
 
   bool _isScanning = false;
   bool get isScanningNow => _isScanning;
+
+  // N1: 分别跟踪 BLE 和 Classic 两侧扫描状态，两侧都结束才推 false
+  bool _isBleScanning = false;
+  bool _isClassicScanning = false;
 
   final StreamController<bool> _isScanningController =
       StreamController<bool>.broadcast();
@@ -44,11 +58,104 @@ class FlutterBluetooth {
 
   final StreamController<List<ScanResult>> _scanResultsController =
       StreamController<List<ScanResult>>.broadcast();
-  Stream<List<ScanResult>> get scanResults => _scanResultsController.stream;
+  List<ScanResult>? _lastScanResultsSnapshot;
+  /// 扫描结果流（累积）。重新监听会重发上次结果。
+  Stream<List<ScanResult>> get scanResults => _BehaviorStream(
+      _scanResultsController.stream, () => _lastScanResultsSnapshot);
+
+  // 单条扫描结果流，不重发历史。
+  final StreamController<ScanResult> _onScanResultController =
+      StreamController<ScanResult>.broadcast();
+  /// 单条扫描结果流（不重发历史）。每个新结果推送一次。
+  Stream<ScanResult> get onScanResults => _onScanResultController.stream;
+
+  // ─── RFCOMM 服务器状态 ──────────────────────────────────────────────────
+
+  final StreamController<RfcommServerState> _rfcommServerStateController =
+      StreamController<RfcommServerState>.broadcast();
+  /// RFCOMM 服务器状态变化流。
+  Stream<RfcommServerState> get rfcommServerState =>
+      _rfcommServerStateController.stream;
+
+  bool _isServerRunning = false;
+  /// 当前 RFCOMM 服务器是否正在运行（同步）。
+  bool get isServerRunning => _isServerRunning;
+
+  String? _serverUuid;
+  /// 当前服务器使用的 UUID（运行后有效）。
+  String? get serverUuid => _serverUuid;
+
+  // ─── 配对请求处理 ────────────────────────────────────────────────────────
+
+  final StreamController<PairingRequest> _pairingRequestController =
+      StreamController<PairingRequest>.broadcast();
+  /// 配对请求事件流。
+  ///
+  /// 启用配对请求处理后，系统发起配对时推送事件。
+  /// Dart 端需在 [PairingVariant.needsResponse] 为 true 时调用
+  /// [respondPairingRequest] 响应，否则配对会超时失败。
+  Stream<PairingRequest> get pairingRequest => _pairingRequestController.stream;
+
+  /// 启用配对请求处理。
+  ///
+  /// 启用后，所有配对请求将拦截并推送至 [pairingRequest] 流，
+  /// 系统默认配对 UI 不会出现。
+  Future<bool> enablePairingRequestHandling() async {
+    return await _channel.invokeMethod<bool>('enablePairingRequestHandling') ?? false;
+  }
+
+  /// 禁用配对请求处理，恢复系统默认配对 UI。
+  Future<void> disablePairingRequestHandling() async {
+    await _channel.invokeMethod('disablePairingRequestHandling');
+  }
+
+  /// 响应配对请求 — 设置 PIN。
+  ///
+  /// 适用于 [PairingVariant.pin] 变体。
+  /// 返回是否成功设置（设备未在 pending 列表中返回 false）。
+  Future<bool> respondPairingPin({
+    required String remoteId,
+    required String pin,
+  }) async {
+    return await _channel.invokeMethod<bool>('respondPairingRequest', {
+      'remoteId': remoteId,
+      'responseType': 'pin',
+      'pin': pin,
+    }) ?? false;
+  }
+
+  /// 响应配对请求 — 确认或拒绝。
+  ///
+  /// 适用于 [PairingVariant.passkeyConfirmation] 和 [PairingVariant.consent] 变体。
+  Future<bool> respondPairingConfirmation({
+    required String remoteId,
+    required bool confirm,
+  }) async {
+    return await _channel.invokeMethod<bool>('respondPairingRequest', {
+      'remoteId': remoteId,
+      'responseType': 'confirmation',
+      'confirm': confirm,
+    }) ?? false;
+  }
 
   // ─── 设备 ──────────────────────────────────────────────────────────────
 
   final Map<DeviceIdentifier, BluetoothDevice> _knownDevices = {};
+
+  /// 每设备的串行操作队列（perDevice 模式）。
+  /// 同一设备的 GATT 操作串行执行，避免 GATT_BUSY (133) 错误。
+  final Map<DeviceIdentifier, _OperationQueue> _deviceQueues = {};
+
+  /// 获取（或创建）指定设备的操作队列。
+  _OperationQueue _getQueue(DeviceIdentifier remoteId) {
+    return _deviceQueues.putIfAbsent(remoteId, () => _OperationQueue());
+  }
+
+  /// 移除设备队列（设备彻底断开后清理）。
+  void _removeQueue(DeviceIdentifier remoteId) {
+    _deviceQueues[remoteId]?.clear();
+    _deviceQueues.remove(remoteId);
+  }
 
   /// 当前应用已连接的设备列表。
   List<BluetoothDevice> get connectedDevices =>
@@ -97,10 +204,61 @@ class FlutterBluetooth {
       case 'rfcommDataReceived':
         _handleRfcommDataReceived(map);
         break;
+      case 'rfcommServerStateChanged':
+        _handleRfcommServerStateChanged(map);
+        break;
+      case 'pairingRequest':
+        _handlePairingRequest(map);
+        break;
+      case 'scanStopped':
+        _handleScanStopped(map);
+        break;
       case 'scanError':
         _handleScanError(map);
         break;
+      case 'log':
+        _handleLog(map);
+        break;
     }
+  }
+
+  void _handleLog(Map<String, dynamic> map) {
+    final levelStr = map['level'] as String? ?? 'INFO';
+    final message = map['message'] as String? ?? '';
+    final timestamp = map['timestamp'] as int? ?? 0;
+    final time = DateTime.fromMillisecondsSinceEpoch(timestamp);
+    final line = '[${time.toIso8601String()}] [$levelStr] $message';
+    _logsController.add(line);
+  }
+
+  void _handleRfcommServerStateChanged(Map<String, dynamic> map) {
+    final stateStr = map['state'] as String? ?? 'stopped';
+    final running = stateStr == 'started';
+    _isServerRunning = running;
+    final uuid = map['uuid'] as String?;
+    if (running) {
+      _serverUuid = uuid;
+    } else {
+      _serverUuid = null;
+    }
+    _rfcommServerStateController.add(
+      RfcommServerState(isRunning: running, uuid: _serverUuid),
+    );
+  }
+
+  void _handlePairingRequest(Map<String, dynamic> map) {
+    final remoteId = map['remoteId'] as String;
+    final variantStr = map['variant'] as String? ?? 'unknown';
+    final variantCode = (map['variantCode'] as num?)?.toInt() ?? -1;
+    final pairingKey = (map['pairingKey'] as num?)?.toInt() ?? -1;
+
+    final request = PairingRequest(
+      remoteId: remoteId,
+      variant: PairingVariant.fromString(variantStr),
+      variantCode: variantCode,
+      pairingKey: pairingKey,
+    );
+    _pairingRequestController.add(request);
   }
 
   void _handleAdapterStateChanged(Map<String, dynamic> map) {
@@ -120,7 +278,11 @@ class FlutterBluetooth {
     _lastScanResults.removeWhere(
         (r) => r.device.remoteId == result.device.remoteId);
     _lastScanResults.add(result);
-    _scanResultsController.add(List.unmodifiable(_lastScanResults));
+    final snapshot = List<ScanResult>.unmodifiable(_lastScanResults);
+    _lastScanResultsSnapshot = snapshot;
+    _scanResultsController.add(snapshot);
+    // 同时推送单条流
+    _onScanResultController.add(result);
   }
 
   void _handleConnectionStateChanged(Map<String, dynamic> map) {
@@ -130,9 +292,25 @@ class FlutterBluetooth {
         ? BluetoothConnectionState.connected
         : BluetoothConnectionState.disconnected;
 
+    // B5: 接收原生上报的断开原因（status + HCI 状态字符串）
+    final disconnectReasonCode = map['disconnectReasonCode'] as int?;
+    final disconnectReasonString = map['disconnectReasonString'] as String?;
+
     final device = _knownDevices[remoteId];
     if (device != null) {
+      if (state == BluetoothConnectionState.disconnected &&
+          disconnectReasonCode != null &&
+          disconnectReasonCode != 0) {
+        device._setDisconnectReason(disconnectReasonCode, disconnectReasonString);
+      }
       device._updateConnectionState(state);
+    }
+    // 设备完全断开（BLE + RFCOMM 都断）时清理操作队列
+    if (state == BluetoothConnectionState.disconnected) {
+      final d = _knownDevices[remoteId];
+      if (d == null || (!d._isBleConnected && !d._isRfcommConnected)) {
+        _removeQueue(remoteId);
+      }
     }
   }
 
@@ -183,23 +361,57 @@ class FlutterBluetooth {
     final stateStr = map['state'] as String;
     final connected = stateStr == 'connected';
 
-    final device = _knownDevices[remoteId];
-    device?._updateRfcommConnection(connected);
+    // 服务器模式接受的传入连接可能来自未扫描设备，自动创建并注册
+    final device = _knownDevices.putIfAbsent(
+      remoteId,
+      () => BluetoothDevice(remoteId: remoteId),
+    );
+    device._updateRfcommConnection(connected);
   }
 
   void _handleRfcommDataReceived(Map<String, dynamic> map) {
     final remoteId = map['remoteId'] as String;
-    final data = Uint8List.fromList(List<int>.from(map['data'] as List));
+    // 原生直接传 ByteArray，StandardMessageCodec 解码为 Uint8List
+    final data = map['data'] as Uint8List;
 
-    final device = _knownDevices[remoteId];
-    device?._addRfcommData(data);
+    // 服务器模式接受的设备可能尚未注册，自动创建
+    final device = _knownDevices.putIfAbsent(
+      remoteId,
+      () => BluetoothDevice(remoteId: remoteId),
+    );
+    device._addRfcommData(data);
   }
 
   void _handleScanError(Map<String, dynamic> map) {
     final errorCode = map['errorCode'] as int? ?? -1;
-    print('[FlutterBluetooth] BLE scan failed with error code: $errorCode');
-    _isScanning = false;
-    _isScanningController.add(false);
+    final message = map['message'] as String? ?? '';
+    print('[FlutterBluetooth] Scan failed (code=$errorCode): $message');
+    // Q2: scanError 事件需回滚扫描状态。按 source 区分（与 scanStopped 一致）
+    // 原生未带 source 时默认 ble（BLE 侧 onScanFailed 不带 source）
+    final source = map['source'] as String? ?? 'ble';
+    if (source == 'classic') {
+      _isClassicScanning = false;
+    } else {
+      _isBleScanning = false;
+    }
+    if (!_isBleScanning && !_isClassicScanning && _isScanning) {
+      _isScanning = false;
+      _isScanningController.add(false);
+    }
+  }
+
+  void _handleScanStopped(Map<String, dynamic> map) {
+    // N1: 按 source 区分，两侧都结束才推 false
+    final source = map['source'] as String? ?? 'ble';
+    if (source == 'classic') {
+      _isClassicScanning = false;
+    } else {
+      _isBleScanning = false;
+    }
+    if (!_isBleScanning && !_isClassicScanning && _isScanning) {
+      _isScanning = false;
+      _isScanningController.add(false);
+    }
   }
 
   // ─── 公共 API ──────────────────────────────────────────────────────────
@@ -233,6 +445,17 @@ class FlutterBluetooth {
     await _channel.invokeMethod('turnOn', {'timeout': timeout});
   }
 
+  /// 关闭蓝牙（仅 Android，Android 13+ 已弃用直接关闭）。
+  Future<void> turnOff() async {
+    await _channel.invokeMethod('turnOff');
+  }
+
+  /// 设置日志级别。仅 [LogLevel.error] 及以上级别会通过 [logs] 流输出。
+  Future<void> setLogLevel(LogLevel level, {bool color = true}) async {
+    _logLevel = level;
+    await _channel.invokeMethod('setLogLevel', {'level': level.index});
+  }
+
   /// 开始扫描经典蓝牙和 BLE 设备。
   ///
   /// [withServices] — 按广播服务 UUID 过滤扫描结果。
@@ -259,6 +482,9 @@ class FlutterBluetooth {
 
     _lastScanResults.clear();
     _isScanning = true;
+    // N1: 两侧分别跟踪
+    _isBleScanning = true;
+    _isClassicScanning = scanClassic;
     _isScanningController.add(true);
 
     final args = <String, dynamic>{
@@ -270,6 +496,8 @@ class FlutterBluetooth {
       'scanClassic': scanClassic,
     };
 
+    // Q2: 原生 startScan 是 fire-and-forget，错误通过 scanError 事件回滚状态
+    // （见 _handleScanError），此处不需 try-catch
     await _channel.invokeMethod('startScan', args);
 
     if (timeout != null) {
@@ -284,6 +512,9 @@ class FlutterBluetooth {
   /// 停止扫描蓝牙设备。
   Future<void> stopScan() async {
     if (!_isScanning) return;
+    // N1: 主动停止时两侧都清，避免原生 scanStopped 事件延迟到达
+    _isBleScanning = false;
+    _isClassicScanning = false;
     _isScanning = false;
     _isScanningController.add(false);
     await _channel.invokeMethod('stopScan');
@@ -407,7 +638,7 @@ class FlutterBluetooth {
   Future<void> _createBond({
     required String remoteId,
     int timeout = 90,
-    List<int>? pin,
+    String? pin,
   }) async {
     await _channel.invokeMethod('createBond', {
       'remoteId': remoteId,
@@ -568,6 +799,8 @@ class FlutterBluetooth {
     required String remoteId,
     required List<int> data,
   }) async {
+    // Q4: 未连接时原生抛 PlatformException(NOT_CONNECTED)，调用方需 try-catch
+    // 写入失败返回 false，区分两种错误状态
     final result = await _channel.invokeMethod<bool>('sendRfcommData', {
       'remoteId': remoteId,
       'data': data,
@@ -592,6 +825,54 @@ class FlutterBluetooth {
     return result ?? false;
   }
 
+  Future<Uint8List?> _readRfcommData({
+    required String remoteId,
+    int maxSize = 1024,
+  }) async {
+    final result = await _channel.invokeMethod<List>('readRfcommData', {
+      'remoteId': remoteId,
+      'maxSize': maxSize,
+    });
+    if (result == null) return null;
+    return Uint8List.fromList(result.cast<int>());
+  }
+
+  // ─── RFCOMM 服务器模式 ────────────────────────────────────────────────
+
+  /// 启动 RFCOMM 服务器，监听传入连接（默认 SPP UUID）。
+  ///
+  /// 启动后通过 [rfcommServerState] 流推送状态变化，
+  /// 接受到的连接会以普通 RFCOMM 连接形式出现（通过各 [BluetoothDevice]
+  /// 的 [BluetoothDevice.onRfcommDataReceived] 接收数据）。
+  Future<bool> startServer({String? uuid, String? name}) async {
+    final result = await _channel.invokeMethod<bool>('startServer', {
+      'uuid': uuid,
+      'name': name,
+    });
+    return result ?? false;
+  }
+
+  /// 停止 RFCOMM 服务器。已建立的连接不受影响。
+  Future<void> stopServer() async {
+    await _channel.invokeMethod('stopServer');
+  }
+
+  // ─── 订阅生命周期辅助 ─────────────────────────────────────────────────
+
+  /// 在扫描结束时自动取消订阅。
+  ///
+  /// 返回的 [StreamSubscription] 在 [isScanning] 变为 false 时自动取消。
+  /// 适用于绑定到单次扫描生命周期的临时监听。
+  StreamSubscription<T> cancelWhenScanComplete<T>(StreamSubscription<T> sub) {
+    final scanSub = isScanning.listen((scanning) {
+      if (!scanning) {
+        sub.cancel();
+      }
+    });
+    sub.onDone(() => scanSub.cancel());
+    return sub;
+  }
+
   // ─── 辅助方法 ──────────────────────────────────────────────────────────
 
   BluetoothAdapterState _parseAdapterState(String state) {
@@ -604,6 +885,8 @@ class FlutterBluetooth {
         return BluetoothAdapterState.turningOn;
       case 'turningOff':
         return BluetoothAdapterState.turningOff;
+      case 'unauthorized':
+        return BluetoothAdapterState.unauthorized;
       default:
         return BluetoothAdapterState.unknown;
     }
@@ -628,5 +911,9 @@ class FlutterBluetooth {
     _adapterStateController.close();
     _isScanningController.close();
     _scanResultsController.close();
+    _onScanResultController.close();
+    _logsController.close();
+    _rfcommServerStateController.close();
+    _pairingRequestController.close();
   }
 }

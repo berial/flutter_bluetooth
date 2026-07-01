@@ -7,7 +7,6 @@
 library flutter_bluetooth;
 
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 

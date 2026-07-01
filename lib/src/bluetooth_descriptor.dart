@@ -49,34 +49,42 @@ class BluetoothDescriptor {
   }
 
   /// 读取描述符值。
+  ///
+  /// 入队执行，保证与同设备其他 GATT 操作串行，避免 GATT_BUSY (133)。
   Future<Uint8List> read({int timeout = 15}) async {
-    final value = await FlutterBluetooth.instance._readDescriptor(
-      remoteId: remoteId,
-      primaryServiceUuid: primaryServiceUuid,
-      serviceUuid: serviceUuid,
-      characteristicUuid: characteristicUuid,
-      instanceId: instanceId,
-      descriptorUuid: descriptorUuid,
-      timeout: timeout,
-    );
-    _lastValue = value;
-    _lastValueController.add(value);
-    _onValueReceivedController.add(value);
-    return value;
+    return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
+      final value = await FlutterBluetooth.instance._readDescriptor(
+        remoteId: remoteId,
+        primaryServiceUuid: primaryServiceUuid,
+        serviceUuid: serviceUuid,
+        characteristicUuid: characteristicUuid,
+        instanceId: instanceId,
+        descriptorUuid: descriptorUuid,
+        timeout: timeout,
+      );
+      _lastValue = value;
+      _lastValueController.add(value);
+      _onValueReceivedController.add(value);
+      return value;
+    });
   }
 
   /// 向描述符写入值。
+  ///
+  /// 入队执行，保证与同设备其他 GATT 操作串行，避免 GATT_BUSY (133)。
   Future<void> write(List<int> value, {int timeout = 15}) async {
-    await FlutterBluetooth.instance._writeDescriptor(
-      remoteId: remoteId,
-      primaryServiceUuid: primaryServiceUuid,
-      serviceUuid: serviceUuid,
-      characteristicUuid: characteristicUuid,
-      instanceId: instanceId,
-      descriptorUuid: descriptorUuid,
-      value: value,
-      timeout: timeout,
-    );
+    return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
+      await FlutterBluetooth.instance._writeDescriptor(
+        remoteId: remoteId,
+        primaryServiceUuid: primaryServiceUuid,
+        serviceUuid: serviceUuid,
+        characteristicUuid: characteristicUuid,
+        instanceId: instanceId,
+        descriptorUuid: descriptorUuid,
+        value: value,
+        timeout: timeout,
+      );
+    });
   }
 
   /// 释放该描述符持有的流控制器资源。

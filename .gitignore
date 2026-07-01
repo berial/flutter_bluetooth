@@ -19,6 +19,9 @@ migrate_working_dir/
 # VS Code related
 .vscode/
 
+# Code graph / IDE tool cache
+.codegraph/
+
 # Flutter/Dart/Pub related
 **/doc/api/
 **/ios/Flutter/.last_build_id
