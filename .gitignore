@@ -21,6 +21,8 @@ migrate_working_dir/
 
 # Code graph / IDE tool cache
 .codegraph/
+.omo/
+.workbuddy/
 
 # Flutter/Dart/Pub related
 **/doc/api/

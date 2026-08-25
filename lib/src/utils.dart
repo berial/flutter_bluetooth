@@ -30,7 +30,7 @@ class _BehaviorStream<T> extends Stream<T> {
 ///
 /// 入队操作不会阻塞调用线程 — [enqueue] 立即返回一个 [Future]，
 /// 实际执行排在队列尾，结果通过返回的 Future 传递。
-class _OperationQueue {
+class OperationQueue {
   Future<void> _tail = Future.value();
 
   /// 将异步任务加入队列尾部，返回任务结果的 Future。
@@ -55,6 +55,8 @@ class _OperationQueue {
     _tail = Future.value();
   }
 }
+
+typedef _OperationQueue = OperationQueue;
 
 // ─── Guid ───────────────────────────────────────────────────────────────────
 

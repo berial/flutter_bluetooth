@@ -129,7 +129,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager?.adapter
 
-        bleManager = BleManager(context, bluetoothAdapter, bluetoothManager!!, ::sendEvent, ::onDeviceDisconnected)
+        bleManager = BleManager(context, bluetoothAdapter, bluetoothManager!!, ::sendEvent, ::onDeviceConnected, ::onDeviceDisconnected)
         classicManager = ClassicBluetoothManager(context, bluetoothAdapter, ::sendEvent)
         rfcommManager = RfcommManager(bluetoothAdapter, ::sendEvent, ::onRfcommDisconnected)
         pairingRequestManager = PairingRequestManager(context, ::sendEvent)
@@ -320,7 +320,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
 
         // R3: bleManager.connect 内部已 scope.launch，无需外层再 launch
-        bleManager.connect(device, autoConnect, result, ::onDeviceConnected, desiredMtu = mtu)
+        bleManager.connect(device, autoConnect, result, desiredMtu = mtu)
     }
 
     private fun handleDisconnect(call: MethodCall, result: MethodChannel.Result) {

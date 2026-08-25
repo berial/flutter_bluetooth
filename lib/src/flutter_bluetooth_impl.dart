@@ -839,6 +839,13 @@ class FlutterBluetooth {
 
   // ─── RFCOMM 服务器模式 ────────────────────────────────────────────────
 
+  /// 启动 RFCOMM 服务器（[startServer] 别名），监听传入连接（默认 SPP UUID）。
+  Future<bool> startRfcommServer({String? uuid, String? name}) =>
+      startServer(uuid: uuid, name: name);
+
+  /// 停止 RFCOMM 服务器（[stopServer] 别名）。
+  Future<void> stopRfcommServer() => stopServer();
+
   /// 启动 RFCOMM 服务器，监听传入连接（默认 SPP UUID）。
   ///
   /// 启动后通过 [rfcommServerState] 流推送状态变化，

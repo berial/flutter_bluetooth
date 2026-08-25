@@ -30,6 +30,7 @@ class BleManager(
     private val bluetoothAdapter: BluetoothAdapter?,
     private val bluetoothManager: BluetoothManager,
     private val sendEvent: (Map<String, Any?>) -> Unit,
+    private val onDeviceConnected: (String, BluetoothGatt?) -> Unit,
     private val onDeviceDisconnected: (String, Int, String) -> Unit
 ) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -51,7 +52,6 @@ class BleManager(
     // 等待 MTU 协商完成的连接请求
     private data class PendingConnect(
         val result: MethodChannel.Result,
-        val onConnected: (String, BluetoothGatt?) -> Unit,
         val desiredMtu: Int? = null
     )
     private val pendingConnects = ConcurrentHashMap<String, PendingConnect>()
@@ -280,7 +280,7 @@ class BleManager(
     // ─── 连接管理 ────────────────────────────────────────────────────────
 
     fun connect(device: BluetoothDevice, autoConnect: Boolean, result: MethodChannel.Result,
-                onConnected: (String, BluetoothGatt?) -> Unit, desiredMtu: Int? = null) {
+                desiredMtu: Int? = null) {
         scope.launch {
             try {
                 // B1: 显式传 TRANSPORT_LE，部分外设默认 AUTO 传输下连接失败
@@ -294,9 +294,9 @@ class BleManager(
 
                 if (desiredMtu != null && desiredMtu > DEFAULT_MTU) {
                     // 延迟连接结果，等待 MTU 协商完成
-                    pendingConnects[device.address] = PendingConnect(result, onConnected, desiredMtu)
+                    pendingConnects[device.address] = PendingConnect(result, desiredMtu)
                 } else {
-                    // 无需请求 MTU，立即报告已连接
+                    // 无需请求 MTU，连接建立时直接返回
                     pendingCallbacks["connect_${device.address}"] = result
                 }
             } catch (e: SecurityException) {
@@ -738,39 +738,51 @@ class BleManager(
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            val address = gatt.device.address
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                val address = gatt.device.address
-                val pendingConnect = pendingConnects.remove(address)
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    onDeviceConnected(address, gatt)
+                    val pendingConnect = pendingConnects.remove(address)
 
-                if (pendingConnect != null) {
-                    // 连接时请求了 MTU — 延迟 350ms 再发起，等待外设主动下发的 MTU 更新完成
-                    // I8: 避免 predelay 期间与外设自动 MTU 更新混淆导致后续 discoverServices 失败
-                    scope.launch {
-                        delay(MTU_REQUEST_PREDELAY_MS)
-                        // N12: predelay 期间用户可能已 disconnect，gatt 已从 gattMap 移除
-                        if (!gattMap.containsKey(address)) {
-                            return@launch
+                    if (pendingConnect != null) {
+                        // 连接时请求了 MTU — 延迟 350ms 再发起，等待外设主动下发的 MTU 更新完成
+                        // I8: 避免 predelay 期间与外设自动 MTU 更新混淆导致后续 discoverServices 失败
+                        scope.launch {
+                            delay(MTU_REQUEST_PREDELAY_MS)
+                            // N12: predelay 期间用户可能已 disconnect，gatt 已从 gattMap 移除
+                            if (!gattMap.containsKey(address)) {
+                                return@launch
+                            }
+                            try {
+                                gatt.requestMtu(pendingConnect.desiredMtu ?: 512)
+                                // 保存连接信息供 onMtuChanged 回调使用
+                                pendingConnects["mtu_pending_$address"] = pendingConnect
+                            } catch (e: SecurityException) {
+                                // MTU 请求失败，仍然报告已连接
+                                pendingConnect.result.success(null)
+                            }
                         }
-                        try {
-                            gatt.requestMtu(pendingConnect.desiredMtu ?: 512)
-                            // 保存连接信息供 onMtuChanged 回调使用
-                            pendingConnects["mtu_pending_$address"] = pendingConnect
-                        } catch (e: SecurityException) {
-                            // MTU 请求失败，仍然报告已连接
-                            pendingConnect.result.success(null)
-                            pendingConnect.onConnected(address, gatt)
-                        }
+                    } else {
+                        val key = "connect_$address"
+                        pendingCallbacks.remove(key)?.success(null)
                     }
                 } else {
+                    // status != GATT_SUCCESS
+                    val pendingConnect = pendingConnects.remove(address)
+                    pendingConnect?.result?.error("CONNECT_FAILED", "Connection failed with status $status (${hciStatusString(status)})", null)
                     val key = "connect_$address"
-                    pendingCallbacks.remove(key)?.success(null)
+                    pendingCallbacks.remove(key)?.error("CONNECT_FAILED", "Connection failed with status $status (${hciStatusString(status)})", null)
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                val address = gatt.device.address
                 gattMap.remove(address)
                 mtuMap.remove(address)
-                pendingConnects.remove(address)
-                pendingConnects.remove("mtu_pending_$address")
+                val pendingConnect = pendingConnects.remove(address)
+                pendingConnect?.result?.error("DISCONNECTED", "Device disconnected with status $status (${hciStatusString(status)})", null)
+                val pendingMtuConnect = pendingConnects.remove("mtu_pending_$address")
+                pendingMtuConnect?.result?.error("DISCONNECTED", "Device disconnected during MTU negotiation with status $status", null)
+                val connectKey = "connect_$address"
+                pendingCallbacks.remove(connectKey)?.error("DISCONNECTED", "Device disconnected with status $status (${hciStatusString(status)})", null)
+
                 val isAutoConnect = autoConnectMap[address] == true
                 // I7: autoConnect 设备跳过 gatt.close()，保留句柄供系统后台重连
                 if (!isAutoConnect) {
@@ -822,19 +834,13 @@ class BleManager(
 
                 // 如果是 connect() 发起的自动 MTU 请求，完成连接
                 val pendingConnect = pendingConnects.remove("mtu_pending_$address")
-                if (pendingConnect != null) {
-                    pendingConnect.result.success(null)
-                    pendingConnect.onConnected(address, gatt)
-                }
+                pendingConnect?.result?.success(null)
             } else {
                 result?.error("GATT_ERROR", "MTU change failed: $status", null)
 
                 // MTU 协商失败 — 仍以默认 MTU 报告已连接
                 val pendingConnect = pendingConnects.remove("mtu_pending_$address")
-                if (pendingConnect != null) {
-                    pendingConnect.result.success(null)
-                    pendingConnect.onConnected(address, gatt)
-                }
+                pendingConnect?.result?.success(null)
             }
         }
 
@@ -880,38 +886,36 @@ class BleManager(
 
             // 检查是否有分包写入队列
             val chunkedWrite = pendingChunkedWrites[writeKey]
-            if (chunkedWrite != null && chunkedWrite.chunks.isNotEmpty() && status == BluetoothGatt.GATT_SUCCESS) {
-                // 发送下一个分包
-                val nextChunk = chunkedWrite.chunks.removeAt(0)
-                val nextChar = findCharacteristic(gatt, chunkedWrite.serviceUuid, chunkedWrite.characteristicUuid)
-                if (nextChar == null) {
-                    // T2: 特征不可用，清理队列并报错后直接 return，避免后续重复 success
+            if (chunkedWrite != null) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
                     pendingChunkedWrites.remove(writeKey)
-                    chunkedWrite.result.error("GATT_ERROR", "Characteristic not found for chunked write", null)
+                    chunkedWrite.result.error("GATT_ERROR", "Chunked write failed at intermediate chunk: $status", null)
                     return
                 }
-                // T2: 写入下一分包；writeSingleChunk 内部失败时 failChunkedWrite 会清理队列并报错
-                writeSingleChunk(gatt, nextChar, nextChunk, chunkedWrite.withoutResponse,
-                    gatt.device.address, chunkedWrite.characteristicUuid, null)
-                // T2: 若 writeSingleChunk 已通过 failChunkedWrite 清理队列（S1 场景），直接 return
-                if (!pendingChunkedWrites.containsKey(writeKey)) return
-                // 如果这是最后一个剩余分包，清理并报告成功
-                if (chunkedWrite.chunks.isEmpty()) {
+
+                if (chunkedWrite.chunks.isNotEmpty()) {
+                    // 发送下一个分包
+                    val nextChunk = chunkedWrite.chunks.removeAt(0)
+                    val nextChar = findCharacteristic(gatt, chunkedWrite.serviceUuid, chunkedWrite.characteristicUuid)
+                    if (nextChar == null) {
+                        // T2: 特征不可用，清理队列并报错后直接 return
+                        pendingChunkedWrites.remove(writeKey)
+                        chunkedWrite.result.error("GATT_ERROR", "Characteristic not found for chunked write", null)
+                        return
+                    }
+                    // 写入下一分包
+                    writeSingleChunk(gatt, nextChar, nextChunk, chunkedWrite.withoutResponse,
+                        gatt.device.address, chunkedWrite.characteristicUuid, null)
+                    return
+                } else {
+                    // 所有分包均已发送且最后一个分包写入确认成功
                     pendingChunkedWrites.remove(writeKey)
                     chunkedWrite.result.success(null)
+                    return
                 }
-                return
-            }
-
-            // 分包写入中任一分包失败，清理队列并报错
-            if (chunkedWrite != null && status != BluetoothGatt.GATT_SUCCESS) {
-                pendingChunkedWrites.remove(writeKey)
-                chunkedWrite.result.error("GATT_ERROR", "Chunked write failed at intermediate chunk: $status", null)
-                return
             }
 
             // 无分包写入 — 普通单次写入回调
-            pendingChunkedWrites.remove(writeKey)
             val key = "write_${gatt.device.address}_$charUuid"
             // R6: 取消超时协程，避免泄漏
             writeTimeoutJobs.remove(key)?.cancel()

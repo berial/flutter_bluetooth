@@ -179,6 +179,17 @@ class BluetoothDevice {
         description: 'Connect timeout',
       );
     }
+
+    if (!autoConnect && !isConnected) {
+      throw FlutterBluetoothException(
+        platform: _disconnectReason?.platform ?? ErrorPlatform.android,
+        function: 'connect',
+        code: _disconnectReason?.code.toString() ??
+            FbpErrorCode.deviceIsDisconnected.name,
+        description: _disconnectReason?.description ??
+            'Device failed to connect or disconnected',
+      );
+    }
   }
 
   /// 取消进行中的连接尝试。
@@ -187,7 +198,7 @@ class BluetoothDevice {
   /// 并触发 [connect] 调用方的异常或正常返回（取决于底层是否已连上）。
   void cancelConnect() {
     if (!isConnecting) return;
-    _disconnectReason = DisconnectReason(
+    _disconnectReason ??= DisconnectReason(
       platform: ErrorPlatform.fbp,
       code: FbpErrorCode.connectionCanceled.index,
       description: 'Connection canceled by user',
@@ -436,11 +447,10 @@ class BluetoothDevice {
     required Guid characteristicUuid,
     bool forceIndications = false,
   }) {
-    // 如果已有活跃的数据流，先清理旧的
-    _bleDataStreamController?.close();
-    _bleDataStreamController = StreamController<Uint8List>();
-
-    final controller = _bleDataStreamController!;
+    final controller = _bleDataStreamControllers.putIfAbsent(
+      characteristicUuid,
+      () => StreamController<Uint8List>.broadcast(),
+    );
 
     // 异步初始化：发现服务、查找特征、启用通知
     () async {
@@ -463,8 +473,10 @@ class BluetoothDevice {
         }
 
         if (char == null) {
-          controller.addError(Exception(
-              'Characteristic not found: $characteristicUuid'));
+          if (!controller.isClosed) {
+            controller.addError(Exception(
+                'Characteristic not found: $characteristicUuid'));
+          }
           return;
         }
 
@@ -473,20 +485,23 @@ class BluetoothDevice {
 
         // 转发数据
         char.onValueReceived.listen(
-          (value) => controller.add(value),
-          onError: controller.addError,
-          onDone: controller.close,
+          (value) {
+            if (!controller.isClosed) controller.add(value);
+          },
+          onError: (e) {
+            if (!controller.isClosed) controller.addError(e);
+          },
         );
       } catch (e) {
-        controller.addError(e);
+        if (!controller.isClosed) controller.addError(e);
       }
     }();
 
     return controller.stream;
   }
 
-  /// 缓存的 BLE 数据流控制器，防止多次调用 getBleDataStream 泄漏。
-  StreamController<Uint8List>? _bleDataStreamController;
+  /// 缓存的 BLE 数据流控制器映射表，按特征 UUID 区分。
+  final Map<Guid, StreamController<Uint8List>> _bleDataStreamControllers = {};
 
   /// ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -519,7 +534,10 @@ class BluetoothDevice {
 
   /// 释放该设备持有的所有资源（流控制器等）。
   void dispose() {
-    _bleDataStreamController?.close();
+    for (final c in _bleDataStreamControllers.values) {
+      c.close();
+    }
+    _bleDataStreamControllers.clear();
     _connectionStateController.close();
     _bondStateController.close();
     _mtuController.close();
