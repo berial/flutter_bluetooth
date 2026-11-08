@@ -32,6 +32,7 @@ class _BehaviorStream<T> extends Stream<T> {
 /// 实际执行排在队列尾，结果通过返回的 Future 传递。
 class OperationQueue {
   Future<void> _tail = Future.value();
+  int _generation = 0;
 
   /// 将异步任务加入队列尾部，返回任务结果的 Future。
   ///
@@ -39,8 +40,17 @@ class OperationQueue {
   /// 即使前一个任务失败，后续任务仍会执行（失败不会阻塞队列）。
   Future<T> enqueue<T>(Future<T> Function() task) {
     final completer = Completer<T>();
+    final generation = _generation;
     _tail = _tail.then((_) async {
       try {
+        if (generation != _generation) {
+          throw FlutterBluetoothException(
+            platform: ErrorPlatform.fbp,
+            function: 'operationQueue',
+            code: FbpErrorCode.deviceIsDisconnected.name,
+            description: 'Operation canceled before it started',
+          );
+        }
         final result = await task();
         completer.complete(result);
       } catch (e, st) {
@@ -50,8 +60,9 @@ class OperationQueue {
     return completer.future;
   }
 
-  /// 清空队列（设备断开时调用）。
+  /// 清空队列并取消尚未开始的任务（设备断开时调用）。
   void clear() {
+    _generation++;
     _tail = Future.value();
   }
 }

@@ -43,6 +43,8 @@ class FlutterBluetooth {
   // ─── 扫描 ──────────────────────────────────────────────────────────────
 
   bool _isScanning = false;
+  Timer? _scanTimer;
+  int _scanGeneration = 0;
   bool get isScanningNow => _isScanning;
 
   // N1: 分别跟踪 BLE 和 Classic 两侧扫描状态，两侧都结束才推 false
@@ -140,7 +142,7 @@ class FlutterBluetooth {
 
   // ─── 设备 ──────────────────────────────────────────────────────────────
 
-  final Map<DeviceIdentifier, BluetoothDevice> _knownDevices = {};
+  final _knownDevices = BluetoothDevice._devices;
 
   /// 每设备的串行操作队列（perDevice 模式）。
   /// 同一设备的 GATT 操作串行执行，避免 GATT_BUSY (133) 错误。
@@ -270,10 +272,6 @@ class FlutterBluetooth {
 
   void _handleScanResult(Map<String, dynamic> map) {
     final result = ScanResult.fromMap(map);
-    // 更新或添加设备
-    if (!_knownDevices.containsKey(result.device.remoteId)) {
-      _knownDevices[result.device.remoteId] = result.device;
-    }
     // 移除同一设备的旧扫描结果
     _lastScanResults.removeWhere(
         (r) => r.device.remoteId == result.device.remoteId);
@@ -362,11 +360,9 @@ class FlutterBluetooth {
     final connected = stateStr == 'connected';
 
     // 服务器模式接受的传入连接可能来自未扫描设备，自动创建并注册
-    final device = _knownDevices.putIfAbsent(
-      remoteId,
-      () => BluetoothDevice(remoteId: remoteId),
-    );
+    final device = BluetoothDevice.fromId(remoteId);
     device._updateRfcommConnection(connected);
+    if (!connected && !device._isBleConnected) _removeQueue(device.remoteId);
   }
 
   void _handleRfcommDataReceived(Map<String, dynamic> map) {
@@ -375,10 +371,7 @@ class FlutterBluetooth {
     final data = map['data'] as Uint8List;
 
     // 服务器模式接受的设备可能尚未注册，自动创建
-    final device = _knownDevices.putIfAbsent(
-      remoteId,
-      () => BluetoothDevice(remoteId: remoteId),
-    );
+    final device = BluetoothDevice.fromId(remoteId);
     device._addRfcommData(data);
   }
 
@@ -395,8 +388,7 @@ class FlutterBluetooth {
       _isBleScanning = false;
     }
     if (!_isBleScanning && !_isClassicScanning && _isScanning) {
-      _isScanning = false;
-      _isScanningController.add(false);
+      _finishScan();
     }
   }
 
@@ -409,8 +401,7 @@ class FlutterBluetooth {
       _isBleScanning = false;
     }
     if (!_isBleScanning && !_isClassicScanning && _isScanning) {
-      _isScanning = false;
-      _isScanningController.add(false);
+      _finishScan();
     }
   }
 
@@ -440,12 +431,12 @@ class FlutterBluetooth {
     }
   }
 
-  /// 开启蓝牙（仅 Android）。
+  /// 开启蓝牙（仅 Android）。系统需要确认时，[timeout] 为等待用户确认的秒数。
   Future<void> turnOn({int timeout = 60}) async {
     await _channel.invokeMethod('turnOn', {'timeout': timeout});
   }
 
-  /// 关闭蓝牙（仅 Android，Android 13+ 已弃用直接关闭）。
+  /// 关闭蓝牙（仅 Android）。系统限制直接关闭时抛出 `NOT_SUPPORTED`。
   Future<void> turnOff() async {
     await _channel.invokeMethod('turnOff');
   }
@@ -474,13 +465,17 @@ class FlutterBluetooth {
     String scanMode = 'lowLatency',
     bool scanClassic = true,
   }) async {
+    final generation = ++_scanGeneration;
     if (_isScanning) {
-      await stopScan();
-      // 短暂延迟让适配器稳定
+      _finishScan();
+      await _channel.invokeMethod('stopScan');
       await Future.delayed(const Duration(milliseconds: 100));
     }
+    if (generation != _scanGeneration) return;
 
     _lastScanResults.clear();
+    _lastScanResultsSnapshot = const [];
+    _scanResultsController.add(const []);
     _isScanning = true;
     // N1: 两侧分别跟踪
     _isBleScanning = true;
@@ -496,28 +491,37 @@ class FlutterBluetooth {
       'scanClassic': scanClassic,
     };
 
-    // Q2: 原生 startScan 是 fire-and-forget，错误通过 scanError 事件回滚状态
-    // （见 _handleScanError），此处不需 try-catch
-    await _channel.invokeMethod('startScan', args);
-
-    if (timeout != null) {
-      Future.delayed(timeout, () {
-        if (_isScanning) {
-          stopScan();
-        }
-      });
+    _scanTimer?.cancel();
+    _scanTimer = timeout == null ? null : Timer(timeout, () {
+      if (generation != _scanGeneration) return;
+      unawaited(stopScan().catchError((Object error) {
+        print('[FlutterBluetooth] Stop scan failed: $error');
+      }));
+    });
+    try {
+      await _channel.invokeMethod('startScan', args);
+    } catch (_) {
+      if (generation == _scanGeneration && _isScanning) _finishScan();
+      rethrow;
     }
   }
 
-  /// 停止扫描蓝牙设备。
+  /// 停止蓝牙扫描并取消本次扫描的定时器。
   Future<void> stopScan() async {
+    _scanGeneration++;
     if (!_isScanning) return;
-    // N1: 主动停止时两侧都清，避免原生 scanStopped 事件延迟到达
+    _finishScan();
+    await _channel.invokeMethod('stopScan');
+  }
+
+  /// 清除当前扫描状态及定时器。
+  void _finishScan() {
+    _scanTimer?.cancel();
+    _scanTimer = null;
     _isBleScanning = false;
     _isClassicScanning = false;
     _isScanning = false;
     _isScanningController.add(false);
-    await _channel.invokeMethod('stopScan');
   }
 
   /// 获取系统已连接的蓝牙设备列表。
@@ -532,7 +536,6 @@ class FlutterBluetooth {
       return result.map((d) {
         final device = BluetoothDevice.fromMap(
             Map<String, dynamic>.from(d as Map));
-        _knownDevices[device.remoteId] = device;
         return device;
       }).toList();
     } catch (e, st) {
@@ -551,7 +554,6 @@ class FlutterBluetooth {
       return result.map((d) {
         final device = BluetoothDevice.fromMap(
             Map<String, dynamic>.from(d as Map));
-        _knownDevices[device.remoteId] = device;
         return device;
       }).toList();
     } catch (e, st) {
@@ -565,13 +567,11 @@ class FlutterBluetooth {
   Future<void> _connect({
     required String remoteId,
     bool autoConnect = false,
-    Duration timeout = const Duration(seconds: 35),
     int? mtu,
   }) async {
     await _channel.invokeMethod('connect', {
       'remoteId': remoteId,
       'autoConnect': autoConnect,
-      'timeout': timeout.inSeconds,
       'mtu': mtu,
     });
   }
@@ -581,12 +581,17 @@ class FlutterBluetooth {
     int timeout = 35,
   }) async {
     // 同时断开 BLE 和 RFCOMM 连接
+    await _disconnectBle(remoteId, timeout: timeout);
+    await _channel.invokeMethod('disconnectRfcomm', {
+      'remoteId': remoteId,
+    });
+  }
+
+  /// 仅断开 BLE 链路，供取消连接与完整断开共用。
+  Future<void> _disconnectBle(String remoteId, {int timeout = 35}) async {
     await _channel.invokeMethod('disconnect', {
       'remoteId': remoteId,
       'timeout': timeout,
-    });
-    await _channel.invokeMethod('disconnectRfcomm', {
-      'remoteId': remoteId,
     });
   }
 
@@ -913,6 +918,8 @@ class FlutterBluetooth {
   /// 释放资源。在不再需要插件时调用此方法
   /// （例如在应用的 dispose 生命周期中）。
   void dispose() {
+    _scanGeneration++;
+    _scanTimer?.cancel();
     _eventSubscription?.cancel();
     _eventSubscription = null;
     _adapterStateController.close();

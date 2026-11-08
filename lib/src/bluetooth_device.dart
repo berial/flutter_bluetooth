@@ -4,17 +4,22 @@ part of '../flutter_bluetooth.dart';
 ///
 /// API 模仿 `flutter_blue_plus` BluetoothDevice。
 class BluetoothDevice {
+  static final _devices = <DeviceIdentifier, BluetoothDevice>{};
+
   /// 该设备的唯一硬件地址（例如 "AA:BB:CC:11:22:33"）。
   final DeviceIdentifier remoteId;
 
   /// 平台为该设备广播的名称。
-  final String platformName;
+  String get platformName => _platformName;
+  String _platformName;
 
   /// 扫描期间发现的名称（广播名称）。
-  final String advName;
+  String get advName => _advName;
+  String _advName;
 
   /// 设备类型："classic"、"ble" 或 "dual"
-  final String type;
+  String get type => _type;
+  String _type;
 
   /// 该设备已发现的服务缓存列表。
   List<BluetoothService> _servicesList = [];
@@ -88,12 +93,26 @@ class BluetoothDevice {
 
   // ────────────────────────────────────────────────────────────────────────
 
-  BluetoothDevice({
-    required this.remoteId,
-    this.platformName = '',
-    this.advName = '',
-    this.type = 'ble',
-  });
+  /// 获取同一地址的设备实例，连接状态与其他入口共享。
+  factory BluetoothDevice({
+    required DeviceIdentifier remoteId,
+    String platformName = '',
+    String advName = '',
+    String? type,
+  }) {
+    final address = remoteId.toUpperCase();
+    final device =
+        _devices.putIfAbsent(address, () => BluetoothDevice._(address));
+    if (platformName.isNotEmpty) device._platformName = platformName;
+    if (advName.isNotEmpty) device._advName = advName;
+    if (type != null) device._type = type;
+    return device;
+  }
+
+  BluetoothDevice._(this.remoteId)
+      : _platformName = '',
+        _advName = '',
+        _type = 'ble';
 
   /// 从 map（原生平台数据）创建。
   factory BluetoothDevice.fromMap(Map<String, dynamic> map) {
@@ -101,7 +120,7 @@ class BluetoothDevice {
       remoteId: map['remoteId'] as String,
       platformName: map['platformName'] as String? ?? '',
       advName: map['advName'] as String? ?? '',
-      type: map['type'] as String? ?? 'ble',
+      type: map['type'] as String?,
     );
   }
 
@@ -115,7 +134,7 @@ class BluetoothDevice {
   /// 通过 BLE GATT 连接到该设备。
   ///
   /// 调用时立即推送 [BluetoothConnectionState.connecting] 中间态，
-  /// 连接成功后由原生事件推送 [BluetoothConnectionState.connected]。
+  /// 原生确认连接就绪后推送 [BluetoothConnectionState.connected]。
   /// 连接失败或被 [cancelConnect] 取消则推送 [BluetoothConnectionState.disconnected]。
   ///
   /// [autoConnect] — 如果为 true，Android 将在设备可用时自动重连。
@@ -125,90 +144,70 @@ class BluetoothDevice {
     Duration timeout = const Duration(seconds: 35),
     int? mtu,
   }) async {
-    // 防止重复连接
-    if (isConnecting || isConnected) return;
-
+    if (_connectCompleter != null || _isBleConnected || isDisconnecting) return;
+    final bluetooth = FlutterBluetooth.instance;
+    final canceled = _connectCompleter = Completer<void>();
+    _disconnectReason = null;
     _setConnectionState(BluetoothConnectionState.connecting);
-    _connectCompleter = Completer<void>();
-
-    // 超时定时器
-    Timer? timeoutTimer;
-    bool timedOut = false;
-    if (!autoConnect) {
-      timeoutTimer = Timer(timeout, () {
-        if (_connectCompleter?.isCompleted == false) {
-          timedOut = true;
-          _disconnectReason = DisconnectReason(
-            platform: ErrorPlatform.fbp,
-            code: FbpErrorCode.timeout.index,
-            description: 'Connect timeout after ${timeout.inSeconds}s',
-          );
-          cancelConnect();
-        }
-      });
-    }
-
     try {
-      await FlutterBluetooth.instance._connect(
-        remoteId: remoteId,
-        autoConnect: autoConnect,
-        timeout: timeout,
-        mtu: mtu,
-      );
-      // 成功 — 等待原生推送 connected 事件，由 _setConnectionState 完成 Completer
-      await _connectCompleter!.future;
+      final attempt = Future.any<void>([
+        bluetooth._connect(
+            remoteId: remoteId, autoConnect: autoConnect, mtu: mtu),
+        canceled.future,
+      ]);
+      if (autoConnect) {
+        await attempt;
+      } else {
+        await attempt.timeout(timeout, onTimeout: () {
+          final error = _connectError(FbpErrorCode.timeout, 'Connect timeout');
+          unawaited(bluetooth._disconnectBle(remoteId).catchError((Object _) {}));
+          throw error;
+        });
+      }
+      _isBleConnected = true;
+      _setConnectionState(BluetoothConnectionState.connected);
     } catch (e) {
-      // 原生调用本身失败（权限/参数等）
-      _setConnectionState(BluetoothConnectionState.disconnected);
-      _disconnectReason = DisconnectReason(
+      _disconnectReason ??= DisconnectReason(
         platform: ErrorPlatform.android,
         code: FbpErrorCode.unknown.index,
         description: 'Connect failed: $e',
       );
-      if (!_connectCompleter!.isCompleted) _connectCompleter!.complete();
+      if (!isDisconnecting) {
+        _setConnectionState(_isRfcommConnected
+            ? BluetoothConnectionState.connected
+            : BluetoothConnectionState.disconnected);
+      }
       rethrow;
     } finally {
-      timeoutTimer?.cancel();
-    }
-
-    if (timedOut) {
-      throw FlutterBluetoothException(
-        platform: ErrorPlatform.fbp,
-        function: 'connect',
-        code: FbpErrorCode.timeout.name,
-        description: 'Connect timeout',
-      );
-    }
-
-    if (!autoConnect && !isConnected) {
-      throw FlutterBluetoothException(
-        platform: _disconnectReason?.platform ?? ErrorPlatform.android,
-        function: 'connect',
-        code: _disconnectReason?.code.toString() ??
-            FbpErrorCode.deviceIsDisconnected.name,
-        description: _disconnectReason?.description ??
-            'Device failed to connect or disconnected',
-      );
+      _connectCompleter = null;
     }
   }
 
   /// 取消进行中的连接尝试。
   ///
-  /// 仅在 [isConnecting] 时有效，立即推送 [BluetoothConnectionState.disconnected]，
-  /// 并触发 [connect] 调用方的异常或正常返回（取决于底层是否已连上）。
+  /// 正在等待 [connect] 时，以 `connectionCanceled` 结束该次尝试。
   void cancelConnect() {
-    if (!isConnecting) return;
-    _disconnectReason ??= DisconnectReason(
+    final canceled = _connectCompleter;
+    if (canceled == null || canceled.isCompleted) return;
+    canceled.completeError(_connectError(
+        FbpErrorCode.connectionCanceled, 'Connection canceled by user'));
+    unawaited(FlutterBluetooth.instance._disconnectBle(remoteId)
+        .catchError((Object _) {}));
+  }
+
+  /// 记录由 Dart 发起的连接取消或超时。
+  FlutterBluetoothException _connectError(FbpErrorCode code, String message) {
+    _disconnectReason = DisconnectReason(
       platform: ErrorPlatform.fbp,
-      code: FbpErrorCode.connectionCanceled.index,
-      description: 'Connection canceled by user',
+      code: code.index,
+      description: message,
     );
-    // 主动断开底层 GATT（若已建立）
-    FlutterBluetooth.instance._disconnect(remoteId: remoteId, timeout: 5);
-    _setConnectionState(BluetoothConnectionState.disconnected);
-    if (_connectCompleter?.isCompleted == false) {
-      _connectCompleter!.complete();
-    }
+    return FlutterBluetoothException(
+      platform: ErrorPlatform.fbp,
+      function: 'connect',
+      code: code.name,
+      description: message,
+    );
   }
 
   /// 断开与该设备的连接（包括 BLE GATT 和 RFCOMM）。
@@ -216,17 +215,27 @@ class BluetoothDevice {
   /// 调用时立即推送 [BluetoothConnectionState.disconnecting] 中间态，
   /// 底层断开完成后由原生事件推送 [BluetoothConnectionState.disconnected]。
   Future<void> disconnect({int timeout = 35}) async {
-    if (isDisconnected || isDisconnecting) return;
+    if (isDisconnecting) return;
 
     _setConnectionState(BluetoothConnectionState.disconnecting);
+    final canceled = _connectCompleter;
+    if (canceled != null && !canceled.isCompleted) {
+      canceled.completeError(_connectError(
+          FbpErrorCode.connectionCanceled, 'Connection canceled by user'));
+    }
     try {
       await FlutterBluetooth.instance._disconnect(
         remoteId: remoteId,
         timeout: timeout,
       );
-    } catch (e) {
-      // 即使断开失败也强制推送 disconnected 终态
+      _isBleConnected = false;
+      _clearBleServices();
+      _isRfcommConnected = false;
       _setConnectionState(BluetoothConnectionState.disconnected);
+    } catch (_) {
+      _setConnectionState(_isBleConnected || _isRfcommConnected
+          ? BluetoothConnectionState.connected
+          : BluetoothConnectionState.disconnected);
       rethrow;
     }
   }
@@ -318,7 +327,8 @@ class BluetoothDevice {
   /// 入队执行，保证与同设备其他 GATT 操作串行。
   Future<void> clearGattCache() async {
     return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
-      return FlutterBluetooth.instance._clearGattCache(remoteId);
+      await FlutterBluetooth.instance._clearGattCache(remoteId);
+      _clearBleServices();
     });
   }
 
@@ -379,7 +389,8 @@ class BluetoothDevice {
   ///
   /// 数据由后台 [readLoop] 派发，不直接读取 InputStream，
   /// 因此不会与 [onRfcommDataReceived] 流抢数据。
-  /// 设备未连接或读取超时返回 null。
+  /// 超过 [maxSize] 的余量由后续调用读取。没有余量且设备未连接，
+  /// 或读取超时时，返回 null。
   Future<Uint8List?> readRfcommData({int maxSize = 1024}) async {
     return FlutterBluetooth.instance._getQueue(remoteId).enqueue(() async {
       return FlutterBluetooth.instance._readRfcommData(
@@ -441,67 +452,67 @@ class BluetoothDevice {
 
   /// **BLE** — 便捷方法：获取指定特征的数据流。
   ///
-  /// 如需要会自动发现服务并启用通知。
+  /// 同一服务和特征共用通知订阅，首个订阅决定 [forceIndications]。
+  /// BLE 断开后数据流关闭，重连后可重新获取。
   Stream<Uint8List> getBleDataStream({
     required Guid serviceUuid,
     required Guid characteristicUuid,
     bool forceIndications = false,
   }) {
-    final controller = _bleDataStreamControllers.putIfAbsent(
-      characteristicUuid,
-      () => StreamController<Uint8List>.broadcast(),
-    );
-
-    // 异步初始化：发现服务、查找特征、启用通知
-    () async {
-      try {
-        if (_servicesList.isEmpty) {
-          await discoverServices();
+    final key = (serviceUuid, characteristicUuid);
+    return _bleDataStreamControllers.putIfAbsent(key, () {
+      StreamSubscription<Uint8List>? subscription;
+      var generation = 0;
+      final controller = StreamController<Uint8List>.broadcast();
+      controller.onListen = () async {
+        final current = ++generation;
+        try {
+          if (_servicesList.isEmpty) await discoverServices();
+          if (current != generation || controller.isClosed) return;
+          final characteristic = _servicesList
+              .where((service) => service.serviceUuid == serviceUuid)
+              .expand((service) => service.characteristics)
+              .firstWhere((char) => char.characteristicUuid == characteristicUuid);
+          subscription = characteristic.onValueReceived.listen(
+            controller.add,
+            onError: controller.addError,
+          );
+          final enabled = await characteristic.setNotifyValue(
+            true,
+            forceIndications: forceIndications,
+          );
+          if (!enabled) throw StateError('Could not enable notifications');
+        } catch (error, stack) {
+          if (current != generation || controller.isClosed) return;
+          unawaited(subscription?.cancel());
+          subscription = null;
+          controller.addError(error, stack);
+          _bleDataStreamControllers.remove(key);
+          unawaited(controller.close());
         }
-
-        BluetoothCharacteristic? char;
-        for (final service in _servicesList) {
-          if (service.serviceUuid == serviceUuid) {
-            for (final c in service.characteristics) {
-              if (c.characteristicUuid == characteristicUuid) {
-                char = c;
-                break;
-              }
-            }
-          }
-          if (char != null) break;
-        }
-
-        if (char == null) {
-          if (!controller.isClosed) {
-            controller.addError(Exception(
-                'Characteristic not found: $characteristicUuid'));
-          }
-          return;
-        }
-
-        // 启用通知
-        await char.setNotifyValue(true, forceIndications: forceIndications);
-
-        // 转发数据
-        char.onValueReceived.listen(
-          (value) {
-            if (!controller.isClosed) controller.add(value);
-          },
-          onError: (e) {
-            if (!controller.isClosed) controller.addError(e);
-          },
-        );
-      } catch (e) {
-        if (!controller.isClosed) controller.addError(e);
-      }
-    }();
-
-    return controller.stream;
+      };
+      controller.onCancel = () {
+        generation++;
+        unawaited(subscription?.cancel());
+        subscription = null;
+      };
+      return controller;
+    }).stream;
   }
 
-  /// 缓存的 BLE 数据流控制器映射表，按特征 UUID 区分。
-  final Map<Guid, StreamController<Uint8List>> _bleDataStreamControllers = {};
+  /// 按服务和特征缓存共享的数据流。
+  final _bleDataStreamControllers =
+      <(Guid, Guid), StreamController<Uint8List>>{};
+
+  /// 清理断开连接后失效的服务与通知订阅。
+  void _clearBleServices() {
+    _servicesList = [];
+    for (final controller in _bleDataStreamControllers.values) {
+      controller.onCancel?.call();
+      unawaited(controller.close());
+    }
+    _bleDataStreamControllers.clear();
+  }
 
   /// ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -534,10 +545,8 @@ class BluetoothDevice {
 
   /// 释放该设备持有的所有资源（流控制器等）。
   void dispose() {
-    for (final c in _bleDataStreamControllers.values) {
-      c.close();
-    }
-    _bleDataStreamControllers.clear();
+    if (identical(_devices[remoteId], this)) _devices.remove(remoteId);
+    _clearBleServices();
     _connectionStateController.close();
     _bondStateController.close();
     _mtuController.close();
@@ -546,41 +555,40 @@ class BluetoothDevice {
 
   /// ── 内部状态更新 ──────────────────────────────────────────────────────
 
-  /// 统一的状态切换入口。处理 completer 完成、断开原因、流推送。
+  /// 向监听者发布发生变化的连接状态。
   void _setConnectionState(BluetoothConnectionState state) {
+    if (_connectionState == state || _connectionStateController.isClosed) return;
     _connectionState = state;
     _connectionStateController.add(state);
-
-    // 连接成功 — 完成等待中的 completer
-    if (state == BluetoothConnectionState.connected) {
-      if (_connectCompleter?.isCompleted == false) {
-        _connectCompleter!.complete();
-      }
-    }
-    // 断开终态 — 若有等待中的连接 completer，标记失败
-    else if (state == BluetoothConnectionState.disconnected) {
-      if (_connectCompleter?.isCompleted == false) {
-        _disconnectReason ??= const DisconnectReason(
-          platform: ErrorPlatform.android,
-          code: -1,
-          description: 'Connection lost',
-        );
-        _connectCompleter!.complete();
-      }
-    }
   }
 
-  /// 原生 BLE 连接状态事件入口。
+  /// 更新 BLE 链路，保留同一设备的 RFCOMM 状态。
   void _updateConnectionState(BluetoothConnectionState state) {
-    _isBleConnected = state == BluetoothConnectionState.connected;
-    if (state == BluetoothConnectionState.disconnected && !_isRfcommConnected) {
+    final connected = state == BluetoothConnectionState.connected;
+    if (connected && (_connectCompleter != null || isDisconnecting)) return;
+    _isBleConnected = connected;
+    if (!connected) {
+      _clearBleServices();
       _disconnectReason ??= const DisconnectReason(
         platform: ErrorPlatform.android,
         code: -1,
         description: 'Connection lost',
       );
     }
-    _setConnectionState(state);
+    if (isDisconnecting) return;
+    final canceled = _connectCompleter;
+    if (!connected && canceled != null && !canceled.isCompleted) {
+      final reason = _disconnectReason!;
+      canceled.completeError(FlutterBluetoothException(
+        platform: reason.platform,
+        function: 'connect',
+        code: reason.code.toString(),
+        description: reason.description,
+      ));
+    }
+    _setConnectionState(connected || _isRfcommConnected
+        ? BluetoothConnectionState.connected
+        : BluetoothConnectionState.disconnected);
   }
 
   /// B5: 设置原生上报的断开原因（status + HCI 状态字符串）。
@@ -609,6 +617,7 @@ class BluetoothDevice {
 
   void _updateRfcommConnection(bool connected) {
     _isRfcommConnected = connected;
+    if (_connectCompleter != null || isDisconnecting) return;
     if (connected) {
       _setConnectionState(BluetoothConnectionState.connected);
     } else if (!_isBleConnected) {

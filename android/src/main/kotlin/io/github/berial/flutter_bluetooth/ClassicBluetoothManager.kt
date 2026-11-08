@@ -70,6 +70,7 @@ class ClassicBluetoothManager(
     }
 
     private fun handleDeviceFound(device: BluetoothDevice, rssi: Int) {
+        if (!isScanning) return
         val filter = activeFilter ?: return
 
         val name = try {
@@ -125,22 +126,21 @@ class ClassicBluetoothManager(
             return
         }
         // R9/P5: cancelDiscovery 异步，若正在 discovering 用 postDelayed 非阻塞等待
-        if (bluetoothAdapter?.isDiscovering == true) {
-            try { bluetoothAdapter?.cancelDiscovery() } catch (_: SecurityException) {}
-            activeFilter = filter
-            isScanning = true
-            handler.postDelayed({ doStartDiscovery(filter) }, 300)
+        val discoveringAdapter = bluetoothAdapter?.takeIf { it.isDiscovering }
+        activeFilter = filter
+        isScanning = true
+        if (discoveringAdapter != null) {
+            try { discoveringAdapter.cancelDiscovery() } catch (_: SecurityException) {}
+            handler.postDelayed({ doStartDiscovery() }, 300)
         } else {
-            doStartDiscovery(filter)
+            doStartDiscovery()
         }
     }
 
     /** 实际启动 discovery（registerReceiver + startDiscovery）。 */
-    private fun doStartDiscovery(filter: ScanFilter) {
+    private fun doStartDiscovery() {
         // P5: 等待期间可能已 stopScan，避免竞态重新置 isScanning=true
         if (!isScanning) return
-        activeFilter = filter
-        isScanning = true
 
         val intentFilter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_FOUND)
@@ -160,10 +160,10 @@ class ClassicBluetoothManager(
         }
 
         try {
-            bluetoothAdapter?.startDiscovery()
+            check(bluetoothAdapter?.startDiscovery() == true) { "Android rejected classic discovery" }
             // 兜底超时：系统未发送 ACTION_DISCOVERY_FINISHED 时强制结束
-            handler.postDelayed({ onScanFinished() }, scanTimeoutMs)
-        } catch (e: SecurityException) {
+            handler.postDelayed({ stopScan() }, scanTimeoutMs)
+        } catch (e: Exception) {
             isScanning = false
             handler.removeCallbacksAndMessages(null)
             try { context.unregisterReceiver(discoveryReceiver) } catch (_: Exception) {}

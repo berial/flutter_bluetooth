@@ -1,9 +1,9 @@
 package io.github.berial.flutter_bluetooth
 
 import android.Manifest
+import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
@@ -14,6 +14,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.PluginRegistry
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -29,7 +32,8 @@ import java.util.UUID
  * - BLE 扫描
  * - BLE GATT 连接、服务发现、读/写/通知
  */
-class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
+class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware,
+    PluginRegistry.ActivityResultListener {
 
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
@@ -46,8 +50,10 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var rfcommManager: RfcommManager
     private lateinit var pairingRequestManager: PairingRequestManager
 
-    // 已连接的 GATT 客户端：remoteId -> BluetoothGatt
-    private val connectedGatts = mutableMapOf<String, BluetoothGatt>()
+    private var activityBinding: ActivityPluginBinding? = null
+    private var enableResult: MethodChannel.Result? = null
+    private var enableTimeout: Job? = null
+    private var enableRequestCode = ENABLE_REQUEST_START
 
     // 日志级别（0=none,1=error,2=warning,3=info,4=debug,5=verbose）
     @Volatile
@@ -126,12 +132,12 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         })
 
-        bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         bluetoothAdapter = bluetoothManager?.adapter
 
-        bleManager = BleManager(context, bluetoothAdapter, bluetoothManager!!, ::sendEvent, ::onDeviceConnected, ::onDeviceDisconnected)
+        bleManager = BleManager(context, bluetoothAdapter, ::sendEvent, ::onDeviceConnected, ::onDeviceDisconnected)
         classicManager = ClassicBluetoothManager(context, bluetoothAdapter, ::sendEvent)
-        rfcommManager = RfcommManager(bluetoothAdapter, ::sendEvent, ::onRfcommDisconnected)
+        rfcommManager = RfcommManager(bluetoothAdapter, ::sendEvent)
         pairingRequestManager = PairingRequestManager(context, ::sendEvent)
 
         // 注册适配器状态接收器
@@ -146,12 +152,12 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
-        bleManager.stopScan()
+        bleManager.dispose()
         classicManager.stopScan()
         rfcommManager.dispose()
         pairingRequestManager.dispose()
-        connectedGatts.values.forEach { it.close() }
-        connectedGatts.clear()
+        finishEnable("DETACHED", "Flutter engine detached")
+        eventSink = null
         scope.cancel()
         try { context.unregisterReceiver(adapterStateReceiver) } catch (_: Exception) {}
         try { context.unregisterReceiver(bondStateReceiver) } catch (_: Exception) {}
@@ -195,7 +201,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 "requestMtu" -> handleRequestMtu(call, result)
                 "createBond" -> handleCreateBond(call, result)
                 "removeBond" -> handleRemoveBond(call, result)
-                "clearGattCache" -> handleClearGattCache(call)
+                "clearGattCache" -> handleClearGattCache(call, result)
                 "requestConnectionPriority" -> handleConnectionPriority(call, result)
                 "readCharacteristic" -> handleReadCharacteristic(call, result)
                 "writeCharacteristic" -> handleWriteCharacteristic(call, result)
@@ -233,23 +239,89 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         return bluetoothAdapter?.name ?: "Unknown"
     }
 
+    @Suppress("DEPRECATION")
     private fun handleTurnOn(call: MethodCall, result: MethodChannel.Result) {
-        if (bluetoothAdapter?.isEnabled == false) {
-            bluetoothAdapter?.enable()
+        if (!checkPermission(result)) return
+        val adapter = bluetoothAdapter ?: run {
+            result.error("NOT_SUPPORTED", "Bluetooth unavailable", null)
+            return
         }
-        result.success(null)
+        if (adapter.isEnabled || adapter.enable()) {
+            result.success(null)
+            return
+        }
+        val activity = activityBinding?.activity ?: run {
+            result.error("NO_ACTIVITY", "Enabling Bluetooth requires a foreground Activity", null)
+            return
+        }
+        if (enableResult != null) {
+            result.error("ENABLE_IN_PROGRESS", "Bluetooth enable request already in progress", null)
+            return
+        }
+        enableResult = result
+        try {
+            enableRequestCode = (enableRequestCode + 1) and 0x7fff
+            activity.startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), enableRequestCode)
+            enableTimeout = scope.launch {
+                delay((call.argument<Int>("timeout") ?: 60).coerceAtLeast(1) * 1000L)
+                finishEnable("TIMEOUT", "Bluetooth enable request timed out")
+            }
+        } catch (e: Exception) {
+            finishEnable("ENABLE_FAILED", e.message)
+        }
     }
 
+    @Suppress("DEPRECATION")
     private fun handleTurnOff(result: MethodChannel.Result) {
-        if (bluetoothAdapter?.isEnabled == true) {
-            try {
-                bluetoothAdapter?.disable()
-            } catch (e: SecurityException) {
-                result.error("SECURITY", "Permission denied: ${e.message}", null)
-                return
-            }
+        if (!checkPermission(result)) return
+        val adapter = bluetoothAdapter ?: run {
+            result.error("NOT_SUPPORTED", "Bluetooth unavailable", null)
+            return
         }
-        result.success(null)
+        when {
+            !adapter.isEnabled -> result.success(null)
+            adapter.disable() -> result.success(null)
+            directToggleRestricted() -> result.error("NOT_SUPPORTED", "Turn off Bluetooth in system settings", null)
+            else -> result.error("DISABLE_FAILED", "Android rejected the Bluetooth disable request", null)
+        }
+    }
+
+    private fun directToggleRestricted(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.applicationInfo.targetSdkVersion >= Build.VERSION_CODES.TIRAMISU
+
+    private fun finishEnable(code: String? = null, message: String? = null) {
+        enableTimeout?.cancel()
+        enableTimeout = null
+        val result = enableResult
+        enableResult = null
+        if (code == null) result?.success(null) else result?.error(code, message, null)
+    }
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activityBinding = binding
+        binding.addActivityResultListener(this)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activityBinding?.removeActivityResultListener(this)
+        activityBinding = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        onAttachedToActivity(binding)
+    }
+
+    override fun onDetachedFromActivity() {
+        onDetachedFromActivityForConfigChanges()
+        finishEnable("NO_ACTIVITY", "Activity detached during Bluetooth enable request")
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode != enableRequestCode || enableResult == null) return false
+        if (resultCode == Activity.RESULT_OK) finishEnable()
+        else finishEnable("USER_REJECTED", "Bluetooth enable request declined")
+        return true
     }
 
     private fun handleSetLogLevel(call: MethodCall, result: MethodChannel.Result) {
@@ -275,12 +347,13 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             remoteIds = withRemoteIds
         )
 
-        // 启动 BLE 扫描
-        bleManager.startScan(scanModeStr, filter)
-
-        // 如需要则启动经典蓝牙扫描
-        if (scanClassic) {
-            classicManager.startScan(filter)
+        try {
+            bleManager.startScan(scanModeStr, filter)
+            if (scanClassic) classicManager.startScan(filter)
+        } catch (e: Exception) {
+            bleManager.stopScan()
+            classicManager.stopScan()
+            throw e
         }
 
         result.success(null)
@@ -319,7 +392,6 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             result.error("DEVICE_NOT_FOUND", "Device not found: $remoteId", null); return
         }
 
-        // R3: bleManager.connect 内部已 scope.launch，无需外层再 launch
         bleManager.connect(device, autoConnect, result, desiredMtu = mtu)
     }
 
@@ -328,7 +400,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
 
-        bleManager.disconnect(remoteId)
+        bleManager.disconnect(remoteId.uppercase())
         result.success(null)
     }
 
@@ -338,14 +410,14 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
-        bleManager.discoverServices(remoteId, result)
+        bleManager.discoverServices(remoteId, operationTimeout(call), result)
     }
 
     private fun handleReadRssi(call: MethodCall, result: MethodChannel.Result) {
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
-        bleManager.readRssi(remoteId, result)
+        bleManager.readRssi(remoteId, operationTimeout(call), result)
     }
 
     private fun handleRequestMtu(call: MethodCall, result: MethodChannel.Result) {
@@ -353,7 +425,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
         val desiredMtu = call.argument<Int>("desiredMtu") ?: 512
-        bleManager.requestMtu(remoteId, desiredMtu, result)
+        bleManager.requestMtu(remoteId, desiredMtu, operationTimeout(call), result)
     }
 
     private fun handleCreateBond(call: MethodCall, result: MethodChannel.Result) {
@@ -447,9 +519,11 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
     }
 
-    private fun handleClearGattCache(call: MethodCall) {
-        val remoteId = call.argument<String>("remoteId") ?: return
-        bleManager.clearGattCache(remoteId)
+    private fun handleClearGattCache(call: MethodCall, result: MethodChannel.Result) {
+        val remoteId = call.argument<String>("remoteId") ?: run {
+            result.error("INVALID_ARG", "remoteId required", null); return
+        }
+        bleManager.clearGattCache(remoteId, result)
     }
 
     private fun handleConnectionPriority(call: MethodCall, result: MethodChannel.Result) {
@@ -470,7 +544,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val characteristicUuid = call.argument<String>("characteristicUuid") ?: run {
             result.error("INVALID_ARG", "characteristicUuid required", null); return
         }
-        bleManager.readCharacteristic(remoteId, serviceUuid, characteristicUuid, result)
+        bleManager.readCharacteristic(remoteId, serviceUuid, characteristicUuid, operationTimeout(call), result)
     }
 
     private fun handleWriteCharacteristic(call: MethodCall, result: MethodChannel.Result) {
@@ -483,11 +557,11 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val characteristicUuid = call.argument<String>("characteristicUuid") ?: run {
             result.error("INVALID_ARG", "characteristicUuid required", null); return
         }
-        val value = call.argument<List<Int>>("value")?.map { it.toByte() }?.toByteArray() ?: run {
+        val value = call.readBytes("value") ?: run {
             result.error("INVALID_ARG", "value required", null); return
         }
         val withoutResponse = call.argument<Boolean>("withoutResponse") ?: false
-        bleManager.writeCharacteristic(remoteId, serviceUuid, characteristicUuid, value, withoutResponse, result)
+        bleManager.writeCharacteristic(remoteId, serviceUuid, characteristicUuid, value, withoutResponse, operationTimeout(call), result)
     }
 
     private fun handleSetNotifyValue(call: MethodCall, result: MethodChannel.Result) {
@@ -502,7 +576,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
         val enable = call.argument<Boolean>("enable") ?: false
         val forceIndications = call.argument<Boolean>("forceIndications") ?: false
-        bleManager.setNotifyValue(remoteId, serviceUuid, characteristicUuid, enable, forceIndications, result)
+        bleManager.setNotifyValue(remoteId, serviceUuid, characteristicUuid, enable, forceIndications, operationTimeout(call), result)
     }
 
     private fun handleReadDescriptor(call: MethodCall, result: MethodChannel.Result) {
@@ -518,7 +592,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val descriptorUuid = call.argument<String>("descriptorUuid") ?: run {
             result.error("INVALID_ARG", "descriptorUuid required", null); return
         }
-        bleManager.readDescriptor(remoteId, serviceUuid, characteristicUuid, descriptorUuid, result)
+        bleManager.readDescriptor(remoteId, serviceUuid, characteristicUuid, descriptorUuid, operationTimeout(call), result)
     }
 
     private fun handleWriteDescriptor(call: MethodCall, result: MethodChannel.Result) {
@@ -534,16 +608,15 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val descriptorUuid = call.argument<String>("descriptorUuid") ?: run {
             result.error("INVALID_ARG", "descriptorUuid required", null); return
         }
-        val value = call.argument<List<Int>>("value")?.map { it.toByte() }?.toByteArray() ?: run {
+        val value = call.readBytes("value") ?: run {
             result.error("INVALID_ARG", "value required", null); return
         }
-        bleManager.writeDescriptor(remoteId, serviceUuid, characteristicUuid, descriptorUuid, value, result)
+        bleManager.writeDescriptor(remoteId, serviceUuid, characteristicUuid, descriptorUuid, value, operationTimeout(call), result)
     }
 
     // ─── BleManager 回调 ────────────────────────────────────────────────
 
     private fun onDeviceDisconnected(remoteId: String, status: Int, statusString: String) {
-        connectedGatts.remove(remoteId)
         sendEvent(mapOf(
             "type" to "connectionStateChanged",
             "remoteId" to remoteId,
@@ -553,22 +626,11 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         ))
     }
 
-    private fun onDeviceConnected(remoteId: String, gatt: BluetoothGatt?) {
-        if (gatt != null) {
-            connectedGatts[remoteId] = gatt
-        }
+    private fun onDeviceConnected(remoteId: String) {
         sendEvent(mapOf(
             "type" to "connectionStateChanged",
             "remoteId" to remoteId,
             "state" to "connected"
-        ))
-    }
-
-    private fun onRfcommDisconnected(remoteId: String) {
-        sendEvent(mapOf(
-            "type" to "connectionStateChanged",
-            "remoteId" to remoteId,
-            "state" to "disconnected"
         ))
     }
 
@@ -599,7 +661,7 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val remoteId = call.argument<String>("remoteId") ?: run {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
-        val data = call.argument<List<Int>>("data")?.map { it.toByte() }?.toByteArray() ?: run {
+        val data = call.readBytes("data") ?: run {
             result.error("INVALID_ARG", "data required", null); return
         }
 
@@ -635,6 +697,10 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             result.error("INVALID_ARG", "remoteId required", null); return
         }
         val maxSize = call.argument<Int>("maxSize") ?: 1024
+        if (maxSize <= 0) {
+            result.error("INVALID_ARG", "maxSize must be positive", null)
+            return
+        }
         scope.launch {
             val data = rfcommManager.readDataOnce(remoteId, maxSize)
             if (data != null) {
@@ -668,8 +734,20 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     // ─── 辅助方法 ──────────────────────────────────────────────────────
 
+    private fun operationTimeout(call: MethodCall): Int = call.argument<Int>("timeout") ?: 15
+
+    private fun MethodCall.readBytes(key: String): ByteArray? =
+        when (val value = argument<Any>(key)) {
+            is ByteArray -> value
+            is List<*> -> ByteArray(value.size) { index ->
+                val byte = value[index] as? Int ?: return null
+                byte.toByte()
+            }
+            else -> null
+        }
+
     private fun sendEvent(event: Map<String, Any?>) {
-        scope.launch(Dispatchers.Main) {
+        scope.launch(Dispatchers.Main.immediate) {
             eventSink?.success(event)
         }
     }
@@ -699,6 +777,8 @@ class FlutterBluetoothPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     companion object {
+        private const val ENABLE_REQUEST_START = 0x4642
+
         fun deviceToMap(device: BluetoothDevice, type: String): Map<String, Any?> {
             val name = try { device.name } catch (e: SecurityException) { "Unknown" }
             return mapOf(

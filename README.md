@@ -233,7 +233,8 @@ await FlutterBluetooth.instance.disablePairingRequestHandling();
 |------|------|
 | `isSupported` | 检查设备是否支持蓝牙 |
 | `getAdapterName()` | 获取本机蓝牙适配器名称 |
-| `turnOn()` | 开启蓝牙 |
+| `turnOn()` | 开启蓝牙，必要时显示系统确认对话框 |
+| `turnOff()` | 关闭蓝牙，系统限制直接关闭时抛出 `NOT_SUPPORTED` |
 | `startScan()` | 开始扫描经典蓝牙 + BLE 设备 |
 | `stopScan()` | 停止扫描 |
 | `scanResults` | 扫描结果流 |
@@ -291,11 +292,11 @@ await FlutterBluetooth.instance.disablePairingRequestHandling();
 - **连接中间态**：connecting/disconnecting 由 Dart 端合成，原生只推终态，防止重复连接尝试
 - **RFCOMM 三级回退**：insecure socket → secure socket → 反射 createRfcommSocket(1)，兼容顽固设备
 - **RFCOMM 写入互斥**：per-device Mutex 串行化写入，自动 512 字节分块，避免字节错乱
-- **BLE 分包写入**：按 MTU-3 自动分块，withoutResponse + 大包自动退化为 withResponse 避免死锁
+- **BLE 分包写入**：按 MTU-3 自动分块，每包等待 Android 写入回调。特征支持有响应写入时，大包优先使用有响应模式
 - **autoConnect 重连**：autoConnect 设备断开时跳过 gatt.close() 保留句柄
 - **扫描状态分离**：BLE 和 Classic 分别跟踪，两侧都结束才推全局停止
 - **配对请求拦截**：abortBroadcast 阻止系统 UI，Dart 端程序化响应
-- **超时兜底**：连接 / 写入 / 扫描 / 配对请求均有超时机制，避免 Future 挂死
+- **超时处理**：GATT 操作超时后关闭旧连接，避免迟到的回调被新请求接收。RFCOMM 连接超时会主动关闭阻塞的套接字
 - **Android 13+ 适配**：writeCharacteristic/writeDescriptor 新签名 + 旧 API false 返回值显式报错
 
 ## 项目结构

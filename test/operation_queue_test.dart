@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter_bluetooth/flutter_bluetooth.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+/// 验证设备操作的串行执行和断开时的队列清理。
 void main() {
   group('OperationQueue Tests', () {
     test('Tasks execute serially in order', () async {
@@ -57,6 +60,28 @@ void main() {
       queue.clear();
       final result = await queue.enqueue(() async => 'cleared_ok');
       expect(result, equals('cleared_ok'));
+    });
+
+    test('Clear prevents old queued work from running on the new connection',
+        () async {
+      final queue = OperationQueue();
+      final started = Completer<void>();
+      final running = Completer<void>();
+      final first = queue.enqueue(() {
+        started.complete();
+        return running.future;
+      });
+      final stale = queue.enqueue(() => fail('Old task ran after clear'));
+      final canceled =
+          expectLater(stale, throwsA(isA<FlutterBluetoothException>()));
+      await started.future;
+
+      queue.clear();
+      expect(
+          await queue.enqueue(() async => 'new connection'), 'new connection');
+      running.complete();
+      await first;
+      await canceled;
     });
   });
 }

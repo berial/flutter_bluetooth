@@ -233,7 +233,8 @@ await FlutterBluetooth.instance.disablePairingRequestHandling();
 |------|------|
 | `isSupported` | Check if device supports Bluetooth |
 | `getAdapterName()` | Get local Bluetooth adapter name |
-| `turnOn()` | Turn on Bluetooth |
+| `turnOn()` | Turn on Bluetooth, prompting for system confirmation when required |
+| `turnOff()` | Turn off Bluetooth or report `NOT_SUPPORTED` if Android blocks direct toggling |
 | `startScan()` | Start scanning classic + BLE devices |
 | `stopScan()` | Stop scanning |
 | `scanResults` | Scan results stream |
@@ -291,7 +292,7 @@ This plugin includes the following stability optimizations for LDAR instrument c
 - **Connection intermediate states**: connecting/disconnecting synthesized on Dart side, native pushes only terminal states, preventing duplicate connect attempts
 - **RFCOMM three-tier fallback**: insecure socket → secure socket → reflection createRfcommSocket(1), compatible with stubborn devices
 - **RFCOMM write mutex**: per-device Mutex serializes writes, auto 512-byte chunking, prevents byte corruption
-- **BLE chunked write**: auto-chunks by MTU-3, withoutResponse + large payload auto-degrades to withResponse to avoid deadlock
+- **BLE chunked write**. Each chunk is sized by MTU-3 and waits for Android's write callback. Large payloads use writes with response when the characteristic supports them.
 - **autoConnect reconnect**: autoConnect devices skip gatt.close() on disconnect to preserve handle for reconnect
 - **Scan state separation**: BLE and Classic tracked separately, global stop pushed only when both finish
 - **Pairing request interception**: abortBroadcast blocks system UI, Dart side responds programmatically

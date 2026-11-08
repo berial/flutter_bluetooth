@@ -3,8 +3,10 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter_bluetooth/flutter_bluetooth.dart';
 
+/// 启动蓝牙插件示例。
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const BluetoothExampleApp());
@@ -40,22 +42,32 @@ class BluetoothScanPage extends StatefulWidget {
 }
 
 class _BluetoothScanPageState extends State<BluetoothScanPage> {
+  static const _permissions = MethodChannel('flutter_bluetooth_example/permissions');
+
   bool _isSupported = false;
   bool _isScanning = false;
   BluetoothAdapterState _adapterState = BluetoothAdapterState.unknown;
   String _adapterName = '';
   List<ScanResult> _scanResults = [];
   StreamSubscription<List<ScanResult>>? _scanSubscription;
+  StreamSubscription<bool>? _scanningSubscription;
+  StreamSubscription<BluetoothAdapterState>? _adapterSubscription;
+  bool _startingScan = false;
 
   @override
   void initState() {
     super.initState();
+    final bluetooth = FlutterBluetooth.instance;
+    _scanningSubscription = bluetooth.isScanning.listen((scanning) {
+      setState(() => _isScanning = scanning);
+    });
     _initBluetooth();
   }
 
   Future<void> _initBluetooth() async {
     final supported = await FlutterBluetooth.instance.isSupported;
     final name = await FlutterBluetooth.instance.getAdapterName();
+    if (!mounted) return;
 
     setState(() {
       _isSupported = supported;
@@ -63,40 +75,53 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
     });
 
     if (supported) {
-      FlutterBluetooth.instance.adapterState.listen((state) {
+      _adapterSubscription = FlutterBluetooth.instance.adapterState.listen((state) {
         setState(() => _adapterState = state);
       });
     }
   }
 
   Future<void> _startScan() async {
+    if (_startingScan) return;
+    _startingScan = true;
     try {
-      setState(() => _isScanning = true);
-      _scanResults.clear();
+      final granted =
+          await _permissions.invokeMethod<bool>('requestBluetoothPermissions');
+      if (!mounted) return;
+      if (granted != true) throw StateError('Bluetooth permission denied');
 
-      _scanSubscription = FlutterBluetooth.instance.scanResults.listen((results) {
+      final bluetooth = FlutterBluetooth.instance;
+      final name = await bluetooth.getAdapterName();
+      if (!mounted) return;
+      setState(() => _adapterName = name);
+
+      await _scanSubscription?.cancel();
+      if (!mounted) return;
+      _scanSubscription = bluetooth.scanResults.listen((results) {
         setState(() => _scanResults = List.from(results));
       });
 
-      await FlutterBluetooth.instance.startScan(
+      await bluetooth.startScan(
         scanMode: 'lowLatency',
         scanClassic: true,
         timeout: const Duration(seconds: 30),
       );
     } catch (e) {
-      setState(() => _isScanning = false);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Scan error: $e')),
         );
       }
+    } finally {
+      _startingScan = false;
     }
   }
 
   Future<void> _stopScan() async {
+    final subscription = _scanSubscription;
+    _scanSubscription = null;
+    await subscription?.cancel();
     await FlutterBluetooth.instance.stopScan();
-    _scanSubscription?.cancel();
-    setState(() => _isScanning = false);
   }
 
   Future<void> _connect(BluetoothDevice device) async {
@@ -171,6 +196,8 @@ class _BluetoothScanPageState extends State<BluetoothScanPage> {
   @override
   void dispose() {
     _scanSubscription?.cancel();
+    _scanningSubscription?.cancel();
+    _adapterSubscription?.cancel();
     FlutterBluetooth.instance.stopScan();
     super.dispose();
   }

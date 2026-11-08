@@ -7,7 +7,6 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
-import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
@@ -20,7 +19,6 @@ import android.os.ParcelUuid
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.*
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 管理 BLE 扫描和 GATT 操作。
@@ -28,51 +26,48 @@ import java.util.concurrent.ConcurrentHashMap
 class BleManager(
     private val context: Context,
     private val bluetoothAdapter: BluetoothAdapter?,
-    private val bluetoothManager: BluetoothManager,
     private val sendEvent: (Map<String, Any?>) -> Unit,
-    private val onDeviceConnected: (String, BluetoothGatt?) -> Unit,
+    private val onDeviceConnected: (String) -> Unit,
     private val onDeviceDisconnected: (String, Int, String) -> Unit
 ) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var leScanner: BluetoothLeScanner? = null
 
-    // 活跃的 GATT 连接：remoteId -> BluetoothGatt
-    private val gattMap = ConcurrentHashMap<String, BluetoothGatt>()
+    // 连接状态和所有操作回调在主线程处理。
+    private class Connection(
+        val gatt: BluetoothGatt,
+        val autoConnect: Boolean,
+        var connectResult: MethodChannel.Result?,
+        val desiredMtu: Int?
+    ) {
+        var connected = false
+        var mtu = DEFAULT_MTU
+        var mtuNegotiated = false
+        var mtuJob: Job? = null
+        var initialMtuInFlight = false
+        var operation: Operation? = null
+    }
 
-    // 设备的 autoConnect 标记：用于断开时决定是否跳过 gatt.close() 保留重连句柄
-    private val autoConnectMap = ConcurrentHashMap<String, Boolean>()
-
-    // 等待 GATT 回调的待处理操作
-    private val pendingCallbacks = ConcurrentHashMap<String, MethodChannel.Result>()
-
-    // 每个设备当前协商的 MTU（默认 23 → 最大有效载荷 20 字节）
-    private val mtuMap = ConcurrentHashMap<String, Int>()
-    private val DEFAULT_MTU = 23
-
-    // 等待 MTU 协商完成的连接请求
-    private data class PendingConnect(
+    private class Operation(
+        val key: String,
         val result: MethodChannel.Result,
-        val desiredMtu: Int? = null
-    )
-    private val pendingConnects = ConcurrentHashMap<String, PendingConnect>()
+        val advance: (Any?) -> Boolean
+    ) {
+        var timeout: Job? = null
+    }
 
-    // 分包写入队列：remoteId_charUuid -> 剩余分包
-    private data class ChunkedWrite(
-        val chunks: MutableList<ByteArray>,
-        val serviceUuid: String,
-        val characteristicUuid: String,
-        val withoutResponse: Boolean,
-        val result: MethodChannel.Result
-    )
-    private val pendingChunkedWrites = ConcurrentHashMap<String, ChunkedWrite>()
+    private val connections = mutableMapOf<String, Connection>()
 
     // ─── BLE 扫描 ──────────────────────────────────────────────────────
 
     // I3: 扫描结果去重 — remoteId -> 广播包指纹，相同指纹直接丢弃
-    private val advSeen = ConcurrentHashMap<String, String>()
+    private val advSeen = mutableMapOf<String, String>()
 
-    private val bleScanCallback = object : ScanCallback() {
+    private var bleScanCallback: ScanCallback? = null
+
+    private fun newScanCallback() = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (bleScanCallback !== this) return
             val device = result.device
             val record = result.scanRecord ?: return
 
@@ -122,8 +117,9 @@ class BleManager(
 
             val advMap = mapOf(
                 "advName" to name,
-                "txPowerLevel" to (record.txPowerLevel ?: -128),
-                "connectable" to result.isConnectable,
+                "txPowerLevel" to record.txPowerLevel,
+                // shortcut: API 21–25 does not expose this flag, use the native value on API 26+.
+                "connectable" to (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || result.isConnectable),
                 "manufacturerData" to manufacturerData,
                 "serviceData" to serviceData,
                 "serviceUuids" to serviceUuids
@@ -139,6 +135,8 @@ class BleManager(
         }
 
         override fun onScanFailed(errorCode: Int) {
+            if (bleScanCallback !== this) return
+            bleScanCallback = null
             android.util.Log.e("BleManager", "BLE scan failed with error: $errorCode")
             isScanning = false
             scanHandler.removeCallbacks(scanTimeoutRunnable)
@@ -243,16 +241,19 @@ class BleManager(
 
         isScanning = true
         advSeen.clear()
+        val callback = newScanCallback()
+        bleScanCallback = callback
         try {
             leScanner?.startScan(
                 if (nativeFilters.isEmpty()) null else nativeFilters,
                 settings,
-                bleScanCallback
+                callback
             )
             // N2: 原生兜底超时，防止 Dart 端 crash 后永久扫描
             scanHandler.postDelayed(scanTimeoutRunnable, scanTimeoutMs)
         } catch (e: SecurityException) {
             isScanning = false
+            bleScanCallback = null
             android.util.Log.e("BleManager", "Bluetooth scan permission denied: ${e.message}")
             sendEvent(mapOf(
                 "type" to "scanError",
@@ -266,9 +267,11 @@ class BleManager(
     fun stopScan() {
         if (!isScanning) return
         isScanning = false
+        val callback = bleScanCallback
+        bleScanCallback = null
         scanHandler.removeCallbacks(scanTimeoutRunnable)
         try {
-            leScanner?.stopScan(bleScanCallback)
+            if (callback != null) leScanner?.stopScan(callback)
         } catch (e: SecurityException) {}
         // I4: 推送 scanStopped 事件，Dart 端统一处理（与经典蓝牙侧一致）
         sendEvent(mapOf(
@@ -281,568 +284,392 @@ class BleManager(
 
     fun connect(device: BluetoothDevice, autoConnect: Boolean, result: MethodChannel.Result,
                 desiredMtu: Int? = null) {
-        scope.launch {
-            try {
-                // B1: 显式传 TRANSPORT_LE，部分外设默认 AUTO 传输下连接失败
-                // B8: 先 connectGatt 再 put，避免异常时 gattMap 存入 null
-                val gatt = device.connectGatt(
-                    context, autoConnect, gattCallback,
-                    BluetoothDevice.TRANSPORT_LE
-                )
-                gattMap[device.address] = gatt
-                autoConnectMap[device.address] = autoConnect
+        val address = device.address
+        val existing = connections[address]
+        if (existing?.connected == true) {
+            result.error("ALREADY_CONNECTED", "Device already connected", null)
+            return
+        }
+        if (existing != null) closeConnection(address, existing, "Connection replaced", notify = false)
 
-                if (desiredMtu != null && desiredMtu > DEFAULT_MTU) {
-                    // 延迟连接结果，等待 MTU 协商完成
-                    pendingConnects[device.address] = PendingConnect(result, desiredMtu)
-                } else {
-                    // 无需请求 MTU，连接建立时直接返回
-                    pendingCallbacks["connect_${device.address}"] = result
-                }
-            } catch (e: SecurityException) {
-                result.error("SECURITY", "Permission denied: ${e.message}", null)
-            } catch (e: Exception) {
-                result.error("CONNECT_FAILED", e.message, null)
+        try {
+            val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                device.connectGatt(context, autoConnect, gattCallback)
             }
+            if (gatt == null) {
+                result.error("CONNECT_FAILED", "Unable to open GATT client", null)
+                return
+            }
+            connections[address] = Connection(gatt, autoConnect, result, desiredMtu)
+        } catch (e: SecurityException) {
+            result.error("SECURITY", "Permission denied: ${e.message}", null)
+        } catch (e: Exception) {
+            result.error("CONNECT_FAILED", e.message, null)
         }
     }
 
     fun disconnect(remoteId: String) {
-        val gatt = gattMap[remoteId]
-        if (gatt != null) {
-            try {
-                gatt.disconnect()
-                // 不在此处调用 close() — 由 onConnectionStateChange
-                // 收到 STATE_DISCONNECTED 后执行，避免竞态条件
-            } catch (e: SecurityException) {}
+        val connection = connections[remoteId] ?: return
+        closeConnection(remoteId, connection, "Disconnected by caller")
+    }
+
+    fun dispose() {
+        stopScan()
+        for ((address, connection) in connections.toMap()) {
+            closeConnection(address, connection, "Plugin detached", notify = false)
         }
-        // N3: 用户主动 disconnect = 终止 autoConnect，显式 close 释放句柄
-        // 否则 autoConnect 设备跳过 close 会导致 gatt 泄漏（再次 connect 同一设备时旧 gatt 孤儿）
-        autoConnectMap.remove(remoteId)
-        mtuMap.remove(remoteId)
-        pendingConnects.remove(remoteId)
-        // B6: 清理该设备的所有 pendingCallbacks，避免 Future 挂死
-        val prefix = "${remoteId}_"
-        val keysToFail = pendingCallbacks.keys.filter { it.startsWith(prefix) || it == "connect_$remoteId" }
-        for (key in keysToFail) {
-            pendingCallbacks.remove(key)?.error("DISCONNECTED", "Device disconnected before operation completed", null)
-            // R6: 取消关联的超时 Job
-            writeTimeoutJobs.remove(key)?.cancel()
-        }
-        // 移除该设备的待处理分包写入
-        pendingChunkedWrites.keys.filter { it.startsWith("${remoteId}_") }
-            .forEach {
-                val cw = pendingChunkedWrites.remove(it)
-                cw?.result?.error("DISCONNECTED", "Device disconnected during chunked write", null)
-            }
-        // 通知 Dart 侧 MTU 已重置
-        sendEvent(mapOf(
-            "type" to "mtuChanged",
-            "remoteId" to remoteId,
-            "mtu" to DEFAULT_MTU
-        ))
+        scope.cancel()
+    }
+
+    private fun closeConnection(
+        address: String, connection: Connection, message: String, notify: Boolean = true
+    ) {
+        connections.remove(address)
+        resetLink(connection, message)
+        try { connection.gatt.disconnect() } catch (_: Exception) {}
+        try { connection.gatt.close() } catch (_: Exception) {}
+        if (notify) reportDisconnected(address, 0, message)
+    }
+
+    private fun resetLink(connection: Connection, message: String) {
+        connection.connected = false
+        connection.mtu = DEFAULT_MTU
+        connection.mtuNegotiated = false
+        connection.initialMtuInFlight = false
+        connection.mtuJob?.cancel()
+        connection.mtuJob = null
+        connection.connectResult?.error("DISCONNECTED", message, null)
+        connection.connectResult = null
+        takeOperation(connection)?.result?.error("DISCONNECTED", message, null)
+    }
+
+    private fun reportDisconnected(address: String, status: Int, message: String) {
+        sendMtu(address, DEFAULT_MTU)
+        onDeviceDisconnected(address, status, message)
+    }
+
+    private fun connected(remoteId: String, result: MethodChannel.Result): Connection? {
+        val connection = connections[remoteId]
+        if (connection?.connected == true && connection.connectResult == null) return connection
+        result.error("NOT_CONNECTED", "Device not ready", null)
+        return null
+    }
+
+    private fun completeConnect(address: String, connection: Connection) {
+        connection.mtuJob?.cancel()
+        connection.mtuJob = null
+        val result = connection.connectResult
+        connection.connectResult = null
+        result?.success(null)
+        onDeviceConnected(address)
     }
 
     // ─── GATT 操作 ─────────────────────────────────────────────────────
 
-    fun discoverServices(remoteId: String, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val key = "discover_$remoteId"
-        pendingCallbacks[key] = result
-        try {
-            gatt.discoverServices()
-        } catch (e: SecurityException) {
-            // U1: 清理 pendingCallbacks，避免残留已回复的 result
-            pendingCallbacks.remove(key)
-            result.error("SECURITY", e.message, null)
-        }
-    }
-
-    fun readRssi(remoteId: String, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val key = "readRssi_$remoteId"
-        pendingCallbacks[key] = result
-        try {
-            gatt.readRemoteRssi()
-        } catch (e: SecurityException) {
-            // U1: 清理 pendingCallbacks，避免残留已回复的 result
-            pendingCallbacks.remove(key)
-            result.error("SECURITY", e.message, null)
-        }
-    }
-
-    fun requestMtu(remoteId: String, desiredMtu: Int, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val key = "mtu_$remoteId"
-        pendingCallbacks[key] = result
-        try {
-            gatt.requestMtu(desiredMtu)
-        } catch (e: SecurityException) {
-            // U1: 清理 pendingCallbacks，避免残留已回复的 result
-            pendingCallbacks.remove(key)
-            result.error("SECURITY", e.message, null)
-        }
-    }
-
-    fun readCharacteristic(remoteId: String, serviceUuid: String,
-                           characteristicUuid: String, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val characteristic = findCharacteristic(gatt, serviceUuid, characteristicUuid)
-        if (characteristic == null) {
-            result.error("CHAR_NOT_FOUND", "Characteristic not found", null)
-            return
-        }
-        val key = "read_${remoteId}_$characteristicUuid"
-        pendingCallbacks[key] = result
-        try {
-            gatt.readCharacteristic(characteristic)
-        } catch (e: SecurityException) {
-            // U1: 清理 pendingCallbacks，避免残留已回复的 result
-            pendingCallbacks.remove(key)
-            result.error("SECURITY", e.message, null)
-        }
-    }
-
-    fun writeCharacteristic(remoteId: String, serviceUuid: String,
-                            characteristicUuid: String, value: ByteArray,
-                            withoutResponse: Boolean, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val characteristic = findCharacteristic(gatt, serviceUuid, characteristicUuid)
-        if (characteristic == null) {
-            result.error("CHAR_NOT_FOUND", "Characteristic not found", null)
-            return
-        }
-
-        // 根据协商的 MTU 计算最大有效载荷
-        val currentMtu = mtuMap[remoteId] ?: DEFAULT_MTU
-        // Q3: MTU 下限保护，避免异常值导致 maxPayload ≤ 0 引发分包死循环
-        val maxPayload = (currentMtu - 3).coerceAtLeast(20) // ATT 头部 = 3 字节，最小 20
-
-        // P2: withoutResponse 模式不触发 onCharacteristicWrite 回调，分包队列无法推进
-        // 强制 withoutResponse + 大包场景退化为 withResponse，避免死锁
-        val effectiveWithoutResponse = withoutResponse && value.size <= maxPayload
-
-        if (value.size <= maxPayload) {
-            // 数据可放入单个包 — 直接写入
-            writeSingleChunk(gatt, characteristic, value, effectiveWithoutResponse, remoteId, characteristicUuid, result)
-        } else {
-            // 拆分为多个分包并顺序写入
-            val chunks = value.toList().chunked(maxPayload).map { it.toByteArray() }.toMutableList()
-            val firstChunk = chunks.removeAt(0)
-            val writeKey = "${remoteId}_${FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid)}"
-
-            // 将剩余分包加入队列
-            pendingChunkedWrites[writeKey] = ChunkedWrite(
-                chunks = chunks,
-                serviceUuid = serviceUuid,
-                characteristicUuid = characteristicUuid,
-                withoutResponse = effectiveWithoutResponse,
-                result = result
-            )
-
-            // 写入第一个分包
-            writeSingleChunk(gatt, characteristic, firstChunk, effectiveWithoutResponse, remoteId, characteristicUuid, null)
-        }
-    }
-
-    private fun writeSingleChunk(
-        gatt: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic,
-        value: ByteArray,
-        withoutResponse: Boolean,
-        remoteId: String,
-        characteristicUuid: String,
-        result: MethodChannel.Result?
+    private fun startOperation(
+        connection: Connection,
+        key: String,
+        timeout: Int,
+        result: MethodChannel.Result,
+        advance: (Any?) -> Boolean = { true },
+        start: () -> Boolean
     ) {
-        val writeType = if (withoutResponse)
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        else
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-
-        // B2: Android 13+ (API 33) 用新 API writeCharacteristic(char, value, writeType)
-        val writeOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            try {
-                val rv = gatt.writeCharacteristic(characteristic, value, writeType)
-                if (rv == android.bluetooth.BluetoothStatusCodes.SUCCESS) {
-                    true
-                } else {
-                    // N5: 返回非 SUCCESS 时显式报错，避免 Dart 端 Future 挂死
-                    result?.error("GATT_ERROR", "writeCharacteristic returned $rv", null)
-                    failChunkedWrite(gatt, remoteId, characteristicUuid, "rv=$rv")
-                    false
-                }
-            } catch (e: SecurityException) {
-                result?.error("SECURITY", e.message, null)
-                // B9: 异常时清理整个 ChunkedWrite
-                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "SecurityException")
-                false
-            } catch (e: Exception) {
-                result?.error("GATT_ERROR", e.message, null)
-                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "Exception")
-                false
-            }
-        } else {
-            // T1: 将「正常返回 false」与「抛异常」两条路径互斥处理，
-            // 避免重复调用 result.error / failChunkedWrite
-            @Suppress("DEPRECATION")
-            try {
-                characteristic.value = value
-                characteristic.writeType = writeType
-                val ok = gatt.writeCharacteristic(characteristic)
-                if (!ok) {
-                    // S1: gatt.writeCharacteristic 返回 false 时（GATT 内部忙/特征不支持），
-                    // 显式报错 + 清理 ChunkedWrite，避免 Dart 端 Future 挂死
-                    result?.error("GATT_ERROR", "writeCharacteristic returned false", null)
-                    failChunkedWrite(gatt, remoteId, characteristicUuid, "writeCharacteristic returned false")
-                }
-                ok
-            } catch (e: SecurityException) {
-                result?.error("SECURITY", e.message, null)
-                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "SecurityException")
-                false
-            } catch (e: Exception) {
-                result?.error("GATT_ERROR", e.message, null)
-                failChunkedWrite(gatt, remoteId, characteristicUuid, e.message ?: "Exception")
-                false
-            }
-        }
-
-        if (!writeOk) return
-
-        // R2/R10: withoutResponse 模式立即返回（Android 不保证触发 onCharacteristicWrite，
-        // 分包场景等回调会卡死）；withResponse 模式等待回调 + 超时兜底
-        if (withoutResponse) {
-            result?.success(null)
-        } else if (result != null) {
-            val key = "write_${remoteId}_$characteristicUuid"
-            pendingCallbacks[key] = result
-            val writeTimeoutMs = 15_000L
-            // R6: 保存 Job 以便回调成功时取消，避免协程泄漏
-            val timeoutJob = scope.launch {
-                delay(writeTimeoutMs)
-                val pending = pendingCallbacks.remove(key)
-                pending?.error("TIMEOUT", "Write characteristic timed out", null)
-            }
-            // 关联存储 timeoutJob，onCharacteristicWrite 时取消
-            writeTimeoutJobs[key] = timeoutJob
-        }
-    }
-
-    /** R6: 存储 writeCharacteristic 的超时 Job，成功回调时取消避免协程泄漏。 */
-    private val writeTimeoutJobs = ConcurrentHashMap<String, Job>()
-
-    /** B9: 写入异常时清理整个 ChunkedWrite 队列并报错。 */
-    private fun failChunkedWrite(gatt: BluetoothGatt, remoteId: String, characteristicUuid: String, msg: String) {
-        val writeKey = "${remoteId}_${characteristicUuid}"
-        val cw = pendingChunkedWrites.remove(writeKey)
-        if (cw != null) {
-            try { cw.result.error("GATT_ERROR", "Chunked write failed: $msg", null) } catch (_: Exception) {}
-        }
-    }
-
-    fun setNotifyValue(remoteId: String, serviceUuid: String,
-                       characteristicUuid: String, enable: Boolean,
-                       forceIndications: Boolean,
-                       result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
+        if (connection.operation != null) {
+            result.error("GATT_BUSY", "Another GATT operation is in progress", null)
             return
         }
-        val characteristic = findCharacteristic(gatt, serviceUuid, characteristicUuid)
+        val operation = Operation(key, result, advance)
+        connection.operation = operation
+        try {
+            if (!start()) throw IllegalStateException("Android rejected $key")
+            operation.timeout = scope.launch {
+                delay(timeout.coerceAtLeast(1) * 1000L)
+                takeOperation(connection)?.result?.error("TIMEOUT", "$key timed out", null)
+                // Android callbacks carry no request ID. Retire this link before accepting another operation.
+                closeConnection(connection.gatt.device.address, connection, "$key timed out")
+            }
+        } catch (e: Exception) {
+            failOperation(connection, e)
+        }
+    }
+
+    private fun takeOperation(connection: Connection): Operation? {
+        val operation = connection.operation
+        connection.operation = null
+        operation?.timeout?.cancel()
+        return operation
+    }
+
+    private fun failOperation(connection: Connection, error: Exception) {
+        val code = if (error is SecurityException) "SECURITY" else "GATT_ERROR"
+        takeOperation(connection)?.result?.error(code, error.message, null)
+    }
+
+    private fun completeOperation(connection: Connection, key: String, status: Int, value: Any? = null) {
+        val operation = connection.operation ?: return
+        if (operation.key != key) return
+        try {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                throw IllegalStateException("$key failed: $status")
+            }
+            if (operation.advance(value)) takeOperation(connection)?.result?.success(value)
+        } catch (e: Exception) {
+            failOperation(connection, e)
+        }
+    }
+
+    fun discoverServices(remoteId: String, timeout: Int, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        startOperation(connection, "discover", timeout, result) { connection.gatt.discoverServices() }
+    }
+
+    fun readRssi(remoteId: String, timeout: Int, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        startOperation(connection, "rssi", timeout, result) { connection.gatt.readRemoteRssi() }
+    }
+
+    fun requestMtu(remoteId: String, desiredMtu: Int, timeout: Int, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        if (mtuAlreadyNegotiated(connection)) {
+            result.success(connection.mtu)
+            return
+        }
+        if (connection.initialMtuInFlight) {
+            result.error("GATT_BUSY", "Initial MTU request is still pending", null)
+            return
+        }
+        startOperation(connection, "mtu", timeout, result) { connection.gatt.requestMtu(desiredMtu) }
+    }
+
+    private fun mtuAlreadyNegotiated(connection: Connection): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && connection.mtuNegotiated
+
+    fun readCharacteristic(remoteId: String, serviceUuid: String, characteristicUuid: String,
+                           timeout: Int, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        val characteristic = findCharacteristic(connection.gatt, serviceUuid, characteristicUuid)
         if (characteristic == null) {
             result.error("CHAR_NOT_FOUND", "Characteristic not found", null)
             return
         }
+        startOperation(connection, "read:${characteristic.instanceId}", timeout, result) {
+            connection.gatt.readCharacteristic(characteristic)
+        }
+    }
 
+    fun writeCharacteristic(remoteId: String, serviceUuid: String, characteristicUuid: String,
+                            value: ByteArray, withoutResponse: Boolean, timeout: Int,
+                            result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        val characteristic = findCharacteristic(connection.gatt, serviceUuid, characteristicUuid)
+        if (characteristic == null) {
+            result.error("CHAR_NOT_FOUND", "Characteristic not found", null)
+            return
+        }
+        val maxPayload = (connection.mtu - 3).coerceIn(20, 512)
+        val supportsResponse = (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+        val writeType = if (withoutResponse && (value.size <= maxPayload || !supportsResponse)) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
+        var offset = 0
+        fun writeNext(): Boolean {
+            val end = minOf(offset + maxPayload, value.size)
+            val chunk = if (value.size <= maxPayload) value else value.copyOfRange(offset, end)
+            offset = end
+            return writeChunk(connection.gatt, characteristic, chunk, writeType)
+        }
+        startOperation(connection, "write:${characteristic.instanceId}", timeout, result, advance = {
+            if (offset == value.size) {
+                true
+            } else {
+                check(writeNext()) { "Android rejected a write chunk" }
+                false
+            }
+        }, start = ::writeNext)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun writeChunk(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic,
+                           value: ByteArray, writeType: Int): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return gatt.writeCharacteristic(characteristic, value, writeType) ==
+                android.bluetooth.BluetoothStatusCodes.SUCCESS
+        }
+        characteristic.value = value
+        characteristic.writeType = writeType
+        return gatt.writeCharacteristic(characteristic)
+    }
+
+    fun setNotifyValue(remoteId: String, serviceUuid: String, characteristicUuid: String,
+                       enable: Boolean, forceIndications: Boolean, timeout: Int,
+                       result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        val characteristic = findCharacteristic(connection.gatt, serviceUuid, characteristicUuid)
+        if (characteristic == null) {
+            result.error("CHAR_NOT_FOUND", "Characteristic not found", null)
+            return
+        }
         val properties = characteristic.properties
         val supportsNotify = (properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
         val supportsIndicate = (properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
-
-        // B4: 选择描述符值
-        // - enable=false → DISABLE
-        // - forceIndications=true → 必须 INDICATE（不支持则报错）
-        // - 同时支持 notify+indicate → 默认 NOTIFY（与 iOS CoreBluetooth 一致）
-        // - 只支持其中一种 → 用支持的那种
-        val descriptorValue = if (!enable) {
-            BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-        } else {
-            if (forceIndications) {
-                if (!supportsIndicate) {
-                    result.error("UNSUPPORTED", "Characteristic does not support indicate", null)
-                    return
-                }
-                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-            } else if (supportsNotify) {
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            } else if (supportsIndicate) {
-                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-            } else {
-                result.error("UNSUPPORTED", "Characteristic does not support notify or indicate", null)
+        val value = when {
+            !enable -> BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+            supportsNotify && !forceIndications -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            supportsIndicate -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            else -> {
+                result.error("UNSUPPORTED", "Characteristic does not support the requested notification mode", null)
                 return
             }
         }
-
-        try {
-            val descriptor = characteristic.getDescriptor(
-                UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-            )
-
-            // 本地监听开关
-            gatt.setCharacteristicNotification(characteristic, enable)
-
-            if (descriptor != null) {
-                // B2: Android 13+ 用新 API writeDescriptor(desc, value)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    // N7: Android 13+ 部分 OEM 实现不触发 onDescriptorWrite 回调，
-                    // SUCCESS 后直接 success，避免 Dart 端挂起到 timeout
-                    // R5: enable=false 时返回 false 表示「已关闭通知」
-                    try {
-                        val rv = gatt.writeDescriptor(descriptor, descriptorValue)
-                        if (rv == android.bluetooth.BluetoothStatusCodes.SUCCESS) {
-                            result.success(enable)
-                        } else {
-                            result.error("GATT_ERROR", "writeDescriptor failed: $rv", null)
-                        }
-                    } catch (e: SecurityException) {
-                        result.error("SECURITY", e.message, null)
-                    }
-                } else {
-                    pendingCallbacks["notify_${remoteId}_$characteristicUuid"] = result
-                    @Suppress("DEPRECATION")
-                    try {
-                        descriptor.value = descriptorValue
-                        gatt.writeDescriptor(descriptor)
-                    } catch (e: SecurityException) {
-                        pendingCallbacks.remove("notify_${remoteId}_$characteristicUuid")
-                        result.error("SECURITY", e.message, null)
-                    }
-                }
-            } else {
-                // B7: 无 CCCD 描述符 — 本地监听已开，但未写描述符，返回 false 表示未写
-                result.success(false)
-            }
-        } catch (e: SecurityException) {
-            result.error("SECURITY", e.message, null)
+        val descriptor = characteristic.getDescriptor(CCCD_UUID)
+        if (descriptor == null) {
+            result.success(false)
+            return
+        }
+        startOperation(connection, descriptorKey("notify", descriptor, enable), timeout, result) {
+            connection.gatt.setCharacteristicNotification(characteristic, enable) &&
+                writeDescriptorValue(connection.gatt, descriptor, value)
         }
     }
 
-    fun readDescriptor(remoteId: String, serviceUuid: String,
-                       characteristicUuid: String, descriptorUuid: String,
-                       result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val descriptor = findDescriptor(gatt, serviceUuid, characteristicUuid, descriptorUuid)
+    fun readDescriptor(remoteId: String, serviceUuid: String, characteristicUuid: String,
+                       descriptorUuid: String, timeout: Int, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        val descriptor = findDescriptor(connection.gatt, serviceUuid, characteristicUuid, descriptorUuid)
         if (descriptor == null) {
             result.error("DESC_NOT_FOUND", "Descriptor not found", null)
             return
         }
-        pendingCallbacks["readDesc_${remoteId}_$descriptorUuid"] = result
-        try {
-            gatt.readDescriptor(descriptor)
-        } catch (e: SecurityException) {
-            result.error("SECURITY", e.message, null)
+        startOperation(connection, descriptorKey("readDesc", descriptor), timeout, result) {
+            connection.gatt.readDescriptor(descriptor)
         }
     }
 
-    fun writeDescriptor(remoteId: String, serviceUuid: String,
-                        characteristicUuid: String, descriptorUuid: String,
-                        value: ByteArray, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
-        val descriptor = findDescriptor(gatt, serviceUuid, characteristicUuid, descriptorUuid)
+    fun writeDescriptor(remoteId: String, serviceUuid: String, characteristicUuid: String,
+                        descriptorUuid: String, value: ByteArray, timeout: Int, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        val descriptor = findDescriptor(connection.gatt, serviceUuid, characteristicUuid, descriptorUuid)
         if (descriptor == null) {
             result.error("DESC_NOT_FOUND", "Descriptor not found", null)
             return
         }
-        pendingCallbacks["writeDesc_${remoteId}_$descriptorUuid"] = result
-        // B2: Android 13+ 用新 API writeDescriptor(desc, value)
+        startOperation(connection, descriptorKey("writeDesc", descriptor), timeout, result) {
+            writeDescriptorValue(connection.gatt, descriptor, value)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun writeDescriptorValue(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor,
+                                     value: ByteArray): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            try {
-                val rv = gatt.writeDescriptor(descriptor, value)
-                if (rv != android.bluetooth.BluetoothStatusCodes.SUCCESS) {
-                    pendingCallbacks.remove("writeDesc_${remoteId}_$descriptorUuid")
-                    result.error("GATT_ERROR", "writeDescriptor failed: $rv", null)
-                }
-            } catch (e: SecurityException) {
-                pendingCallbacks.remove("writeDesc_${remoteId}_$descriptorUuid")
-                result.error("SECURITY", e.message, null)
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            try {
-                descriptor.value = value
-                gatt.writeDescriptor(descriptor)
-            } catch (e: SecurityException) {
-                pendingCallbacks.remove("writeDesc_${remoteId}_$descriptorUuid")
-                result.error("SECURITY", e.message, null)
-            }
+            return gatt.writeDescriptor(descriptor, value) == android.bluetooth.BluetoothStatusCodes.SUCCESS
         }
+        descriptor.value = value
+        return gatt.writeDescriptor(descriptor)
+    }
+
+    private fun descriptorKey(action: String, descriptor: BluetoothGattDescriptor, enable: Boolean? = null): String {
+        val key = "$action:${descriptor.characteristic.instanceId}:${descriptor.uuid}"
+        return if (enable == null) key else "$key:$enable"
     }
 
     fun requestConnectionPriority(remoteId: String, priority: Int, result: MethodChannel.Result) {
-        val gatt = gattMap[remoteId]
-        if (gatt == null) {
-            result.error("NOT_CONNECTED", "Device not connected", null)
-            return
-        }
+        val connection = connected(remoteId, result) ?: return
         val connPriority = when (priority) {
-            0 -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
             1 -> BluetoothGatt.CONNECTION_PRIORITY_HIGH
             2 -> BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
             else -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
         }
-        val success = try {
-            gatt.requestConnectionPriority(connPriority)
-        } catch (e: SecurityException) {
-            false
-        }
-        result.success(success)
+        result.success(connection.gatt.requestConnectionPriority(connPriority))
     }
 
-    fun clearGattCache(remoteId: String) {
-        val gatt = gattMap[remoteId] ?: return
-        try {
-            val method = gatt.javaClass.getMethod("refresh")
-            method.invoke(gatt)
-        } catch (_: Exception) {}
+    fun clearGattCache(remoteId: String, result: MethodChannel.Result) {
+        val connection = connected(remoteId, result) ?: return
+        val method = connection.gatt.javaClass.getMethod("refresh")
+        if (method.invoke(connection.gatt) == true) {
+            result.success(null)
+        } else {
+            result.error("GATT_ERROR", "GATT cache refresh failed", null)
+        }
     }
 
     // ─── GATT 回调 ──────────────────────────────────────────────────────
 
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            val address = gatt.device.address
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    onDeviceConnected(address, gatt)
-                    val pendingConnect = pendingConnects.remove(address)
+    private fun forConnection(gatt: BluetoothGatt, callback: (Connection) -> Unit) {
+        scope.launch {
+            val connection = connections[gatt.device.address]
+            if (connection?.gatt === gatt) callback(connection)
+        }
+    }
 
-                    if (pendingConnect != null) {
-                        // 连接时请求了 MTU — 延迟 350ms 再发起，等待外设主动下发的 MTU 更新完成
-                        // I8: 避免 predelay 期间与外设自动 MTU 更新混淆导致后续 discoverServices 失败
-                        scope.launch {
+    private fun sendMtu(address: String, mtu: Int) {
+        sendEvent(mapOf("type" to "mtuChanged", "remoteId" to address, "mtu" to mtu))
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) =
+            forConnection(gatt) { connection ->
+                val address = gatt.device.address
+                if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
+                    val message = hciStatusString(status)
+                    val keepForReconnect = connection.autoConnect && connection.connectResult == null
+                    if (keepForReconnect) {
+                        resetLink(connection, message)
+                    } else {
+                        closeConnection(address, connection, message, notify = false)
+                    }
+                    reportDisconnected(address, status, message)
+                } else if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    connection.connected = true
+                    val desiredMtu = connection.desiredMtu
+                    if (connection.connectResult != null && desiredMtu != null && desiredMtu > DEFAULT_MTU) {
+                        connection.mtuJob = scope.launch {
                             delay(MTU_REQUEST_PREDELAY_MS)
-                            // N12: predelay 期间用户可能已 disconnect，gatt 已从 gattMap 移除
-                            if (!gattMap.containsKey(address)) {
-                                return@launch
+                            connection.initialMtuInFlight = try {
+                                !mtuAlreadyNegotiated(connection) && gatt.requestMtu(desiredMtu)
+                            } catch (_: Exception) {
+                                false
                             }
-                            try {
-                                gatt.requestMtu(pendingConnect.desiredMtu ?: 512)
-                                // 保存连接信息供 onMtuChanged 回调使用
-                                pendingConnects["mtu_pending_$address"] = pendingConnect
-                            } catch (e: SecurityException) {
-                                // MTU 请求失败，仍然报告已连接
-                                pendingConnect.result.success(null)
-                            }
+                            if (connection.initialMtuInFlight) delay(INITIAL_MTU_TIMEOUT_MS)
+                            completeConnect(address, connection)
                         }
                     } else {
-                        val key = "connect_$address"
-                        pendingCallbacks.remove(key)?.success(null)
+                        completeConnect(address, connection)
                     }
+                }
+            }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) =
+            forConnection(gatt) { connection ->
+                val services = if (status == BluetoothGatt.GATT_SUCCESS) {
+                    gatt.services.map { serviceToMap(gatt.device.address, it) }
+                } else null
+                completeOperation(connection, "discover", status, services)
+            }
+
+        override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) =
+            forConnection(gatt) { completeOperation(it, "rssi", status, rssi) }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) =
+            forConnection(gatt) { connection ->
+                if (!connection.connected) return@forConnection
+                val address = gatt.device.address
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    connection.mtu = mtu
+                    connection.mtuNegotiated = true
+                    sendMtu(address, mtu)
+                }
+                if (connection.initialMtuInFlight) {
+                    connection.initialMtuInFlight = false
+                    if (connection.connectResult != null) completeConnect(address, connection)
                 } else {
-                    // status != GATT_SUCCESS
-                    val pendingConnect = pendingConnects.remove(address)
-                    pendingConnect?.result?.error("CONNECT_FAILED", "Connection failed with status $status (${hciStatusString(status)})", null)
-                    val key = "connect_$address"
-                    pendingCallbacks.remove(key)?.error("CONNECT_FAILED", "Connection failed with status $status (${hciStatusString(status)})", null)
+                    completeOperation(connection, "mtu", status, mtu)
                 }
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                gattMap.remove(address)
-                mtuMap.remove(address)
-                val pendingConnect = pendingConnects.remove(address)
-                pendingConnect?.result?.error("DISCONNECTED", "Device disconnected with status $status (${hciStatusString(status)})", null)
-                val pendingMtuConnect = pendingConnects.remove("mtu_pending_$address")
-                pendingMtuConnect?.result?.error("DISCONNECTED", "Device disconnected during MTU negotiation with status $status", null)
-                val connectKey = "connect_$address"
-                pendingCallbacks.remove(connectKey)?.error("DISCONNECTED", "Device disconnected with status $status (${hciStatusString(status)})", null)
-
-                val isAutoConnect = autoConnectMap[address] == true
-                // I7: autoConnect 设备跳过 gatt.close()，保留句柄供系统后台重连
-                if (!isAutoConnect) {
-                    try { gatt.close() } catch (_: Exception) {}
-                }
-                autoConnectMap.remove(address)
-                // B5: 上报断开原因（status + HCI 状态字符串），便于 Dart 端诊断
-                onDeviceDisconnected(address, status, hciStatusString(status))
             }
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val key = "discover_${gatt.device.address}"
-            val result = pendingCallbacks.remove(key)
-
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val services = gatt.services.map { serviceToMap(gatt.device.address, it) }
-                result?.success(services)
-            } else {
-                result?.error("GATT_ERROR", "Service discovery failed: $status", null)
-            }
-        }
-
-        override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
-            val key = "readRssi_${gatt.device.address}"
-            val result = pendingCallbacks.remove(key)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                result?.success(rssi)
-            } else {
-                result?.error("GATT_ERROR", "Read RSSI failed: $status", null)
-            }
-        }
-
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            val address = gatt.device.address
-            val key = "mtu_$address"
-            val result = pendingCallbacks.remove(key)
-
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                // 记录协商后的 MTU
-                mtuMap[address] = mtu
-
-                sendEvent(mapOf(
-                    "type" to "mtuChanged",
-                    "remoteId" to address,
-                    "mtu" to mtu
-                ))
-                result?.success(mtu)
-
-                // 如果是 connect() 发起的自动 MTU 请求，完成连接
-                val pendingConnect = pendingConnects.remove("mtu_pending_$address")
-                pendingConnect?.result?.success(null)
-            } else {
-                result?.error("GATT_ERROR", "MTU change failed: $status", null)
-
-                // MTU 协商失败 — 仍以默认 MTU 报告已连接
-                val pendingConnect = pendingConnects.remove("mtu_pending_$address")
-                pendingConnect?.result?.success(null)
-            }
-        }
 
         // B3: Android 13+ 新签名 onCharacteristicRead（带 byte[] value）
         override fun onCharacteristicRead(
@@ -855,13 +682,13 @@ class BleManager(
         }
 
         // B3: Android 13- 旧签名，委托给新签名
-        @Suppress("DEPRECATION")
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
-            onCharacteristicReadReceived(gatt, characteristic, characteristic.value ?: ByteArray(0), status)
+            onCharacteristicReadReceived(gatt, characteristic, characteristic.value?.copyOf() ?: ByteArray(0), status)
         }
 
         private fun onCharacteristicReadReceived(
@@ -870,61 +697,14 @@ class BleManager(
             value: ByteArray,
             status: Int
         ) {
-            val key = "read_${gatt.device.address}_${FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid)}"
-            val result = pendingCallbacks.remove(key)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                result?.success(value.toList())
-            } else {
-                result?.error("GATT_ERROR", "Read characteristic failed: $status", null)
+            forConnection(gatt) {
+                completeOperation(it, "read:${characteristic.instanceId}", status, value)
             }
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic,
-                                           status: Int) {
-            val charUuid = FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid)
-            val writeKey = "${gatt.device.address}_$charUuid"
-
-            // 检查是否有分包写入队列
-            val chunkedWrite = pendingChunkedWrites[writeKey]
-            if (chunkedWrite != null) {
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    pendingChunkedWrites.remove(writeKey)
-                    chunkedWrite.result.error("GATT_ERROR", "Chunked write failed at intermediate chunk: $status", null)
-                    return
-                }
-
-                if (chunkedWrite.chunks.isNotEmpty()) {
-                    // 发送下一个分包
-                    val nextChunk = chunkedWrite.chunks.removeAt(0)
-                    val nextChar = findCharacteristic(gatt, chunkedWrite.serviceUuid, chunkedWrite.characteristicUuid)
-                    if (nextChar == null) {
-                        // T2: 特征不可用，清理队列并报错后直接 return
-                        pendingChunkedWrites.remove(writeKey)
-                        chunkedWrite.result.error("GATT_ERROR", "Characteristic not found for chunked write", null)
-                        return
-                    }
-                    // 写入下一分包
-                    writeSingleChunk(gatt, nextChar, nextChunk, chunkedWrite.withoutResponse,
-                        gatt.device.address, chunkedWrite.characteristicUuid, null)
-                    return
-                } else {
-                    // 所有分包均已发送且最后一个分包写入确认成功
-                    pendingChunkedWrites.remove(writeKey)
-                    chunkedWrite.result.success(null)
-                    return
-                }
-            }
-
-            // 无分包写入 — 普通单次写入回调
-            val key = "write_${gatt.device.address}_$charUuid"
-            // R6: 取消超时协程，避免泄漏
-            writeTimeoutJobs.remove(key)?.cancel()
-            val result = pendingCallbacks.remove(key)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                result?.success(null)
-            } else {
-                result?.error("GATT_ERROR", "Write characteristic failed: $status", null)
-            }
+                                           status: Int) = forConnection(gatt) {
+            completeOperation(it, "write:${characteristic.instanceId}", status)
         }
 
         // B3: Android 13+ 新签名 onCharacteristicChanged（带 byte[] value）
@@ -937,12 +717,12 @@ class BleManager(
         }
 
         // B3: Android 13- 旧签名，委托给新签名
-        @Suppress("DEPRECATION")
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            onCharacteristicReceived(gatt, characteristic, characteristic.value ?: ByteArray(0))
+            onCharacteristicReceived(gatt, characteristic, characteristic.value?.copyOf() ?: ByteArray(0))
         }
 
         private fun onCharacteristicReceived(
@@ -950,13 +730,16 @@ class BleManager(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            sendEvent(mapOf(
-                "type" to "characteristicNotified",
-                "remoteId" to gatt.device.address,
-                "serviceUuid" to FlutterBluetoothPlugin.uuidToStandardString(characteristic.service.uuid),
-                "characteristicUuid" to FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid),
-                "value" to value.toList()
-            ))
+            forConnection(gatt) {
+                if (!it.connected) return@forConnection
+                sendEvent(mapOf(
+                    "type" to "characteristicNotified",
+                    "remoteId" to gatt.device.address,
+                    "serviceUuid" to FlutterBluetoothPlugin.uuidToStandardString(characteristic.service.uuid),
+                    "characteristicUuid" to FlutterBluetoothPlugin.uuidToStandardString(characteristic.uuid),
+                    "value" to value
+                ))
+            }
         }
 
         // B3: Android 13+ 新签名 onDescriptorRead（带 byte[] value）
@@ -970,13 +753,13 @@ class BleManager(
         }
 
         // B3: Android 13- 旧签名，委托给新签名
-        @Suppress("DEPRECATION")
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onDescriptorRead(
             gatt: BluetoothGatt,
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            onDescriptorReadReceived(gatt, descriptor, descriptor.value ?: ByteArray(0), status)
+            onDescriptorReadReceived(gatt, descriptor, descriptor.value?.copyOf() ?: ByteArray(0), status)
         }
 
         private fun onDescriptorReadReceived(
@@ -985,30 +768,18 @@ class BleManager(
             value: ByteArray,
             status: Int
         ) {
-            val key = "readDesc_${gatt.device.address}_${FlutterBluetoothPlugin.uuidToStandardString(descriptor.uuid)}"
-            val result = pendingCallbacks.remove(key)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                result?.success(value.toList())
-            } else {
-                result?.error("GATT_ERROR", "Read descriptor failed: $status", null)
-            }
+            forConnection(gatt) { completeOperation(it, descriptorKey("readDesc", descriptor), status, value) }
         }
 
-        // B10: 先判 status 再 success，避免失败时 Dart 端拿到成功
-        // N7: Android 13+ notify 路径已直接 success，此回调主要服务 Android 13- 的 notify 和所有版本的 writeDescriptor
-        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            val key = "writeDesc_${gatt.device.address}_${FlutterBluetoothPlugin.uuidToStandardString(descriptor.uuid)}"
-            val characteristicUuid = FlutterBluetoothPlugin.uuidToStandardString(descriptor.characteristic.uuid)
-            val notifyKey = "notify_${gatt.device.address}_$characteristicUuid"
-
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                pendingCallbacks.remove(key)?.success(null)
-                pendingCallbacks.remove(notifyKey)?.success(true)
-            } else {
-                pendingCallbacks.remove(key)?.error("GATT_ERROR", "Write descriptor failed: $status", null)
-                pendingCallbacks.remove(notifyKey)?.error("GATT_ERROR", "Write descriptor failed: $status", null)
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) =
+            forConnection(gatt) { connection ->
+                val key = connection.operation?.key
+                when (key) {
+                    descriptorKey("notify", descriptor, true) -> completeOperation(connection, key, status, true)
+                    descriptorKey("notify", descriptor, false) -> completeOperation(connection, key, status, false)
+                    else -> completeOperation(connection, descriptorKey("writeDesc", descriptor), status)
+                }
             }
-        }
     }
 
     // ─── 辅助方法 ─────────────────────────────────────────────────────
@@ -1043,6 +814,9 @@ class BleManager(
     companion object {
         /** 连接后请求 MTU 前的预延迟（毫秒），等待外设主动 MTU 更新完成。 */
         private const val MTU_REQUEST_PREDELAY_MS = 350L
+        private const val INITIAL_MTU_TIMEOUT_MS = 5_000L
+        private const val DEFAULT_MTU = 23
+        private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         fun serviceToMap(remoteId: String, service: BluetoothGattService): Map<String, Any?> {
             val characteristics = service.characteristics.map { char ->
