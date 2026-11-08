@@ -1,0 +1,39 @@
+// 使用 Groovy DSL：Flutter 3.44 的 Gradle 插件仍以 AGP 旧 DSL 读取 Android 配置，
+// Kotlin DSL 在 AGP 9 下会把旧扩展的访问器判为编译错误。
+//
+// 已迁移到 Built-in Kotlin（AGP 9 内置 Kotlin 支持）：
+// 不再显式 apply "kotlin-android"，也不再使用 android { kotlinOptions { } }。
+// 编译选项改由 kotlin { compilerOptions { } } 提供（需 KGP >= 2.0.0）。
+// 参考：https://docs.flutter.dev/release/breaking-changes/migrate-to-built-in-kotlin/for-plugin-authors
+group = "io.github.berial.flutter_bluetooth"
+version = "1.0"
+
+apply plugin: "com.android.library"
+
+android {
+    namespace "io.github.berial.flutter_bluetooth"
+    compileSdk 34
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main.java.srcDirs += "src/main/kotlin"
+    }
+
+    defaultConfig {
+        minSdk 21
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0"
+}
